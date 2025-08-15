@@ -161,8 +161,13 @@ class WorkflowStep(Entity):
     ) -> Dict[str, Any]:
         """Execute this workflow step using MarketAgent's cognitive architecture."""
         try:
-            if self.environment_name not in mcp_servers:
-                raise ValueError(f"MCP server environment '{self.environment_name}' not found")
+            # Check if MCP server environment is required (only if tools are needed)
+            if self.tools and self.environment_name not in mcp_servers:
+                raise ValueError(f"MCP server environment '{self.environment_name}' not found - required for tools: {[t.name for t in self.tools]}")
+            
+            # If no tools are needed, we can proceed without MCP server
+            if not self.tools:
+                logger.debug(f"No tools required for step '{self.name}', proceeding without MCP server")
             
             # Debug input state
             logger.debug(f"Executing step '{self.name}' with inputs: {inputs}")
@@ -203,23 +208,28 @@ class WorkflowStep(Entity):
             agent.task = combined_task
             agent._refresh_prompts()
 
-            # Debug environment state
-            mcp_server = mcp_servers[self.environment_name]
-            
-            # Create a new action space with only the selected tools
-            selected_action_space = MCPServerActionSpace(
-                mechanism=mcp_server.mechanism,
-                selected_tools=self.tools,
-                workflow=self.sequential_tools and len(self.tools) > 1
-            )
-            
-            # Create a temporary environment with restricted tools
-            mcp_server.action_space = selected_action_space
-            agent.chat_thread.tools = self.tools
-            
-            # Add temporary environment to agent
-            agent.environments[self.environment_name] = mcp_server
-            initial_history_len = len(mcp_server.mechanism.tool_history.get("default", []))
+            # Handle MCP server environment if tools are needed
+            if self.tools and self.environment_name in mcp_servers:
+                mcp_server = mcp_servers[self.environment_name]
+                
+                # Create a new action space with only the selected tools
+                selected_action_space = MCPServerActionSpace(
+                    mechanism=mcp_server.mechanism,
+                    selected_tools=self.tools,
+                    workflow=self.sequential_tools and len(self.tools) > 1
+                )
+                
+                # Create a temporary environment with restricted tools
+                mcp_server.action_space = selected_action_space
+                agent.chat_thread.tools = self.tools
+                
+                # Add temporary environment to agent
+                agent.environments[self.environment_name] = mcp_server
+                initial_history_len = len(mcp_server.mechanism.tool_history.get("default", []))
+            else:
+                # No tools needed, set up for LLM-only execution
+                agent.chat_thread.tools = []
+                initial_history_len = 0
 
             
             # Create action step
@@ -247,8 +257,13 @@ class WorkflowStep(Entity):
                 )
                 results = await agent.run_episode(episode=episode)
                 
-                print(f"Tool Execution History:\n {mcp_server.mechanism.tool_history.get("default", [])}")
-                tool_results = mcp_server.mechanism.tool_history.get("default", [])[initial_history_len:]
+                # Get tool results if MCP server was used
+                if self.tools and self.environment_name in mcp_servers:
+                    mcp_server = mcp_servers[self.environment_name]
+                    print(f"Tool Execution History:\n {mcp_server.mechanism.tool_history.get("default", [])}")
+                    tool_results = mcp_server.mechanism.tool_history.get("default", [])[initial_history_len:]
+                else:
+                    tool_results = []
                 
                 episode_result = EpisodeResult(
                     steps=[
@@ -287,7 +302,13 @@ class WorkflowStep(Entity):
             else:
                 # Run just the action step
                 action_result = await agent.run_step(step=action_step)
-                tool_results = mcp_server.mechanism.tool_history.get("default", [])[initial_history_len:]
+                
+                # Get tool results if MCP server was used
+                if self.tools and self.environment_name in mcp_servers:
+                    mcp_server = mcp_servers[self.environment_name]
+                    tool_results = mcp_server.mechanism.tool_history.get("default", [])[initial_history_len:]
+                else:
+                    tool_results = []
 
                 return WorkflowStepResult(
                     step_id=self.name,
@@ -484,12 +505,15 @@ class Workflow(Entity):
                 logger.error(f"Step '{step.name}' failed: {step_result.error}")
                 results.append(step_result)
 
+        # Collect tool history only from available MCP servers
+        tool_history = {}
+        for env_name, env in self.mcp_servers.items():
+            if hasattr(env, 'mechanism') and hasattr(env.mechanism, 'tool_history'):
+                tool_history[env_name] = env.mechanism.tool_history
+        
         return WorkflowExecutionResult(
             workflow_id=self.name,
             final_state=state,
             step_results=results,
-            tool_history={
-                env_name: env.mechanism.tool_history
-                for env_name, env in self.mcp_servers.items()
-            }
+            tool_history=tool_history
         )
