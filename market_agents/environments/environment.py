@@ -173,7 +173,7 @@ class Mechanism(BaseModel, ABC):
 
 
     @abstractmethod
-    def get_global_state(self) -> Any:
+    def get_global_state(self, agent_id: Optional[str] = None) -> Any:
         """Get the global state of the mechanism."""
         pass
 
@@ -197,7 +197,7 @@ class Notebook(Mechanism):
             info=info
         )
 
-    def get_global_state(self) -> str:
+    def get_global_state(self, agent_id: Optional[str] = None) -> str:
         return self.text
 
 class NotebookActionSpace(ActionSpace):
@@ -279,14 +279,17 @@ class MultiAgentEnvironment(BaseModel):
         """
         pass  # No specific cleanup needed for the basic environment
 
-    def get_global_state(self) -> Any:
+    def get_global_state(self, agent_id: Optional[str] = None) -> Any:
         """
         Return a summary of the global state.
+
+        Args:
+            agent_id (Optional[str]): Optional agent ID for agent-specific state.
 
         Returns:
             Any: The global state.
         """
-        return self.mechanism.get_global_state()
+        return self.mechanism.get_global_state(agent_id)
 
     def get_current_step(self) -> int:
         """
