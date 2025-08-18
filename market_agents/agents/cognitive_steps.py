@@ -60,17 +60,34 @@ class CognitiveStep(BaseModel):
         metadata: Dict[str, Any]
     ) -> None:
         """
-        Store the step's result in agent memory.
+        Store the step's result in agent memory. Be resilient if the agent has
+        not initialized short/long term memory yet.
         """
         memory = MemoryObject(
             agent_id=self.agent_id,
             cognitive_step=self.step_name,
             metadata=metadata,
-            content=json.dumps(content),
+            content=json.dumps(content, ensure_ascii=False, default=str),
             created_at=datetime.now(timezone.utc)
         )
-        agent.episode_steps.append(memory)
-        await agent.short_term_memory.store_memory(memory)
+
+        # Ensure episode_steps list exists
+        try:
+            if not hasattr(agent, "episode_steps") or agent.episode_steps is None:
+                agent.episode_steps = []
+            agent.episode_steps.append(memory)
+        except Exception as e:
+            logger.warning(f"[store_memory] could not append to episode_steps: {e}")
+
+        # Persist to short-term memory if available
+        try:
+            stm = getattr(agent, "short_term_memory", None)
+            if stm and hasattr(stm, "store_memory"):
+                await stm.store_memory(memory)
+            else:
+                logger.debug("[store_memory] short_term_memory not configured; skipping persist")
+        except Exception as e:
+            logger.warning(f"[store_memory] short_term_memory.store_memory failed: {e}")
 
 class CognitiveEpisode(BaseModel):
     """
@@ -97,9 +114,17 @@ class PerceptionStep(CognitiveStep):
     step_name: str = "perception"
 
     async def execute(self, agent: BaseModel) -> Union[str, Dict[str, Any]]:
-        stm_cognitive = await agent.short_term_memory.retrieve_recent_memories(
-            cognitive_step="action"
-        )
+        try:
+            stm = getattr(agent, "short_term_memory", None)
+            if stm and hasattr(stm, "retrieve_recent_memories"):
+                stm_cognitive = await stm.retrieve_recent_memories(
+                    cognitive_step="action"
+                )
+            else:
+                stm_cognitive = []
+        except Exception as e:
+            logger.warning(f"[PerceptionStep] retrieve_recent_memories failed: {e}")
+            stm_cognitive = []
         short_term_memories = [
             {
                 "cognitive_step": mem.cognitive_step,
@@ -118,9 +143,18 @@ class PerceptionStep(CognitiveStep):
         agent_state = f"Agent state: {str(agent.last_action)} {str(agent.last_observation)}"
         query_str = (task_str + "\n" + env_state_str + "\n" + agent_state).strip()
 
-        ltm_episodes = await agent.long_term_memory.retrieve_episodic_memories(
-            agent_id=self.agent_id,
-            query=query_str        )
+        try:
+            ltm = getattr(agent, "long_term_memory", None)
+            if ltm and hasattr(ltm, "retrieve_episodic_memories"):
+                ltm_episodes = await ltm.retrieve_episodic_memories(
+                    agent_id=self.agent_id,
+                    query=query_str
+                )
+            else:
+                ltm_episodes = []
+        except Exception as e:
+            logger.warning(f"[PerceptionStep] retrieve_episodic_memories failed: {e}")
+            ltm_episodes = []
 
         print("\nLong-term Memory Results:")
         memory_strings = [f"Memory {i+1}:\n{episode.model_dump()}" for i, episode in enumerate(ltm_episodes)]
@@ -256,7 +290,7 @@ class ActionStep(CognitiveStep):
                 agent.chat_thread.llm_config.response_format = ResponseFormat.auto_tools
                 print(f"Chat thread after setup: format={agent.chat_thread.llm_config.response_format}, tools={[t.name for t in agent.chat_thread.tools if t]}")
             # Single tool mode
-            elif allowed_actions == 1 and isinstance(allowed_actions[0], CallableTool):
+            elif len(allowed_actions) == 1 and isinstance(allowed_actions[0], (CallableTool, StructuredTool)):
                 agent.chat_thread.llm_config.response_format = ResponseFormat.tool
                 agent.chat_thread.forced_output = allowed_actions[0]
                 agent.chat_thread.tools = allowed_actions
@@ -313,12 +347,23 @@ class ActionStep(CognitiveStep):
 
         result = await agent.execute()
 
+        # StrAction mode: keep plain text to avoid UUID serialization issues
         if isinstance(result, str) and (not allowed_actions or 
             (len(allowed_actions) == 1 and 
              (allowed_actions[0] == StrAction or 
               (isinstance(allowed_actions[0], type) and allowed_actions[0].__name__ == "StrAction")))):
-            result = {"agent_id": agent.id, "action": result}
+            try:
+                logger.debug(
+                    f"[ActionStep] StrAction text preview -> {result[:200]}{'…' if len(result) > 200 else ''}"
+                )
+            except Exception:
+                pass
+            # do not wrap with agent_id
 
+        try:
+            logger.debug(f"[ActionStep] storing result type={type(result).__name__}")
+        except Exception:
+            pass
         await self.store_memory(
             agent,
             content=result,
