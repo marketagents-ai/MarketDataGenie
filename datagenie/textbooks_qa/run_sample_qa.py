@@ -58,9 +58,12 @@ def setup_market_agent() -> MarketAgent:
     
     # Setup LLM configuration
     llm_config = LLMConfig(
-        client="openai",
-        model="gpt-5-nano",
-        temperature=0.5
+        client="litellm",
+        model="Hermes-3-Llama-3.1-405B",
+        #client="openai",
+        #model="gpt-5-nano",
+        temperature=0.5,
+        max_tokens=4096
     )
     
     # Setup LLM orchestrator
@@ -199,12 +202,12 @@ async def run_sample_generation():
             logger.info("Running full-dataset generation via parallel workflow rollouts...")
             # Setup agent (template)
             agent = setup_market_agent()
-            results = await generator.generate_dataset(agent, max_workers=getattr(generator, 'batch_size', 1))
+            results = await generator.generate_dataset(agent, max_workers=getattr(generator, 'batch_size', 1), agent_factory=setup_market_agent)
         else:
             # Sample mode: sequential small run
-            agent = setup_market_agent()
             for i, chunk in enumerate(chunks):
                 logger.info(f"Processing chunk {i+1}/{len(chunks)}: {chunk.id}")
+                agent = setup_market_agent()  # fresh agent per chunk
                 try:
                     result = await generator.generate_qa_for_chunk(chunk, agent)
                     results.append(result)
@@ -241,7 +244,12 @@ async def run_sample_generation():
                 print(f"   Error: {result['error']}")
             else:
                 # Try to get chapter title safely
-                chapter_title = result.get('chapter_title', 'Unknown')
+                chapter_title = (
+                    result.get('chapter_title')
+                    or (result.get('qa_conversation', {}) or {}).get('chapter_title')
+                    or (result.get('metadata', {}) or {}).get('chapter_title')
+                    or 'Unknown'
+                )
                 print(f"   Chapter: {chapter_title}")
 
                 # Check if we have QA conversation data
@@ -253,6 +261,8 @@ async def run_sample_generation():
                         print(f"   Answer: {qa_data['answer']}")
                     if 'quality_score' in qa_data:
                         print(f"   Quality Score: {qa_data['quality_score']}")
+                    if 'rephrased_text' in qa_data:
+                        print(f" Rephrased Text: {qa_data['rephrased_text']}")
                 else:
                     print(f"   Status: Completed but no QA data")
                     print(f"   Result: {type(result.get('qa_conversation', 'No data'))}")
