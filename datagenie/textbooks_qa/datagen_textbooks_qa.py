@@ -54,6 +54,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # Pydantic model for judge metrics (all fields REQUIRED)
 class JudgeMetrics(BaseModel):
     grounded_in_context: float = Field(..., ge=0.0, le=10.0, description="Whether answer is grounded in the context of the provided text")
@@ -140,6 +141,84 @@ class TextbookQAGenerator:
         self.results = []
         self.execution_stats = {}
 
+        # Per-run bookkeeping for incremental saves
+        self.run_timestamp: Optional[str] = None
+        self.results_jsonl_path: Optional[Path] = None
+        self.sharegpt_jsonl_path: Optional[Path] = None
+        self._io_lock: Optional[asyncio.Lock] = None
+
+    def _ensure_run_files(self):
+        """Ensure per-run jsonl file paths are initialized and files exist."""
+        if not self.run_timestamp:
+            self.run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if not self.results_jsonl_path:
+            self.results_jsonl_path = self.output_dir / f"textbook_qa_results_{self.run_timestamp}.jsonl"
+        if not self.sharegpt_jsonl_path:
+            self.sharegpt_jsonl_path = self.output_dir / f"textbook_qa_sharegpt_{self.run_timestamp}.jsonl"
+        # Touch files
+        self.results_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.results_jsonl_path.touch(exist_ok=True)
+        self.sharegpt_jsonl_path.touch(exist_ok=True)
+        if self._io_lock is None:
+            self._io_lock = asyncio.Lock()
+
+    async def _append_jsonl(self, path: Path, obj: Dict[str, Any]):
+        """Append a single JSON object as a line to a JSONL file with async lock to avoid interleaving."""
+        if self._io_lock is None:
+            self._io_lock = asyncio.Lock()
+        line = json.dumps(obj, ensure_ascii=False)
+        async with self._io_lock:
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(line)
+                f.write("\n")
+
+    def _to_sharegpt_item(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert a per-chunk result to one ShareGPT item, mirroring save_sharegpt_dataset formatting."""
+        qa = result.get('qa_conversation') or {}
+        question = qa.get('question') or '"प्रश्न प्रस्तावत हुन्छ?"'
+        answer = qa.get('answer') or ''
+        rephrased_text = qa.get('rephrased_text') or ''
+        metrics = qa.get('metrics') or ''
+        feedback = qa.get('feedback') or ''
+        quality_score = qa.get('quality_score')
+        item = {
+            "id": result['chunk_id'],
+            "conversations": [
+                {"from": "human", "value": question},
+                {"from": "gpt", "value": answer}
+            ],
+            "metadata": {
+                "subject": result.get('subject'),
+                "grade": result.get('grade'),
+                "chapter_title": result.get("chapter_title", ""),
+                "source": (result.get('source') or (result.get('metadata', {}) or {}).get('source') or ""),
+                "execution_time": result.get('execution_time', 0),
+                "timestamp": result.get('timestamp', ''),
+                "context_text": result.get('original_text', ''),
+                "rephrased_text": rephrased_text,
+                "feedback": feedback,
+                "llm_judge_metrics": metrics,
+                "average_score": quality_score
+            }
+        }
+        return item
+
+    def _is_frontmatter(self, title: Optional[str]) -> bool:
+        t = (title or "").strip().lower()
+        if not t:
+            return False
+        # Match "Chapter 0", "Chapter0", or localized/case-insensitive variants, and preface/frontmatter
+        if re.search(r"\bchapter\s*0\b", t):
+            return True
+        if "preface" in t:
+            return True
+        if "frontmatter" in t or "front matter" in t:
+            return True
+        # Explicit exact string provided as example
+        if t == "chapter 0: preface/frontmatter":
+            return True
+        return False
+
     def _extract_qa_from_workflow(self, wf_result: Dict[str, Any]) -> Dict[str, Any]:
         """Extracts question/analysis/answer/judge/coordinator text from workflow_results."""
         def _get_step_content(step_results: List[Dict[str, Any]], step_id: str) -> str:
@@ -154,6 +233,7 @@ class TextbookQAGenerator:
         step_results = (wf_result or {}).get("step_results", [])
         question = _get_step_content(step_results, "questioner")
         answer = _get_step_content(step_results, "answerer")
+        rephrased_text = _get_step_content(step_results, "rephraser")
         judge_text = _get_step_content(step_results, "judge")
 
         # Feedback text variable for downstream use
@@ -221,6 +301,7 @@ class TextbookQAGenerator:
         return {
             "question": question.strip(),
             "answer": answer.strip(),
+            "rephrased_text": rephrased_text.strip(),
             "feedback": feedback_text,
             "quality_score": quality_score,
             "metrics": metrics,
@@ -245,8 +326,8 @@ class TextbookQAGenerator:
         return {"default": default_env}
     
     def load_huggingface_dataset(self) -> List[TextbookChunk]:
-        """Load textbook chunks from HuggingFace dataset using optional schema mapping and split"""
-        return self.task_manager.load_textbook_chunks_from_huggingface(
+        """Load textbook chunks from HuggingFace dataset using optional schema mapping and split, skipping front matter."""
+        chunks = self.task_manager.load_textbook_chunks_from_huggingface(
             dataset_name=self.dataset_name,
             num_chunks=self.num_samples,
             subjects=self.subjects,
@@ -254,9 +335,16 @@ class TextbookQAGenerator:
             split=self.dataset_split,
             schema=self.schema_mapping
         )
+        # Filter out preface/frontmatter or Chapter 0
+        before = len(chunks)
+        chunks = [c for c in chunks if not self._is_frontmatter(getattr(c, "chapter_title", ""))]
+        skipped = before - len(chunks)
+        if skipped:
+            logger.info(f"Skipped {skipped} front-matter chunks (Chapter 0 / Preface / Frontmatter).")
+        return chunks
     
     def create_textbook_qa_workflow(self) -> Workflow:
-        """Create the textbook QA workflow with 5-step dependency chain"""
+        """Create the textbook QA workflow with rephraser step."""
 
         # Create judge tool from Pydantic model
         judge_tool = StructuredTool.from_pydantic(
@@ -266,32 +354,62 @@ class TextbookQAGenerator:
         )
         logger.info("Judge step uses StructuredTool; ensure the agent's LLM config supports tool use (e.g., ResponseFormat.auto_tools)")
 
-        # Define workflow steps using chat environment
         steps = [
             WorkflowStep(
-                name="questioner",
+                name="rephraser",
                 environment_name="default",
                 tools=[],
                 subtask="""
-                Generate an educational question based on the provided textbook chunk.
-                - The question should be in the same language as the text chunk.
-                - The query should be relevant to the subject, chapter and grade level.
-                - The question should not make direct reference to the textbook or chapter used as reference.
-                - The question should be drafted as if no reference material was provided.
-                - For text chunks containing problem sets or example solutions such as in maths, recreate the complete question.
-                - Provide the question directly without filler text such as Here is the generated question...
+                Rephrase the provided textbook chunk in an word for word, information-dense, pedagogically clear and standalone textbook content.
+
+                Guidelines for rephrasing:
+                - Paraphrase in the same language (with interleaved English) as the original text.
+                - Preserve all factual content from the original text without adding external facts or hallucinations.
+                - Increase information density without missing important facts: remove boilerplate, redundancies, asides etc.
+                - Maintain the original language of the text chunk and keep terminology consistent with the subject and grade.
+                - Align to instructional and conversational use: write in a crisp, explanatory tone that is easy to ask/answer questions from.
+                - Define key terms and provide examples; keep symbols, formulas, and units intact.
+                - Avoid references to diagrams or images such as in maths and sciences since this is text only rephrasing.
+                - Fix any OCR junk by correcting the details, equations, notations or the text in original language.
+                - Do not refer to specific chapters or information from the book this chunk belongs to.
+                - The text chunk is split from the whole chapter so make the rephrased content as coherent as possible.
+                - Directly output ONLY the rephrased text without opening text such as: Here is the rephrased...
 
                 Context:
                 - Subject: {subject}
                 - Grade: {grade}
                 - Chapter: {chapter_title}
-                - Text: {text}
+                - Original Text: {text}
+                """,
+                run_full_episode=False
+            ),
+            WorkflowStep(
+                name="questioner",
+                environment_name="default",
+                tools=[],
+                subtask="""
+                Generate an educational question based on the REPHRASED summary produced earlier.
+                - Use the rephrased text as the sole knowledge source.
+                - The question should be in the same language as the rephrased text.
+                - The query should be relevant to the subject, chapter and grade level.
+                - Do not refer to the chapter, grade or subject in your question.
+                - Question should be about the topics not the chapter itself.
+                - For maths/problem-set chunks, recreate a complete solvable question.
+                - Questions should not depend on a diagrams such as in sets, geometry, organic chemistry etc.
+                - Directly start with the question without any preamble.
+
+                Context:
+                - Subject: {subject}
+                - Grade: {grade}
+                - Chapter: {chapter_title}
+                - Rephrased Text: {rephraser}
 
                 Generate a question that:
                 1. Is appropriate for the grade level
                 2. Tests understanding of the key concepts
-                3. Can be answered using the provided text
+                3. Can be answered using the rephrased text
                 4. Is clear and unambiguous
+                5. Can be answered independent of a particular textbook/chapter
                 """,
                 run_full_episode=False
             ),
@@ -300,32 +418,27 @@ class TextbookQAGenerator:
                 environment_name="default",
                 tools=[],
                 subtask="""
-                Generate a comprehensive answer based on the provided text chunk from a chapter.
-                - You may use the text as reference but you should answer as if you are the author of the textbook.
-                - You should answer in the same language as the text query and text chunk.
-                - The answer should be relevant to the subject, chapter and grade level.
-                - The answer should not make direct reference to the textbook or chapter.
-                - The answer should be drafted as if no reference material was provided while using the context from the text.
-                - For problem sets, provide complete correct solutions.
-                - Provide the answer directly without filler text such as Here is the generated answer...
-
+                Provide a comprehensive answer to the generated question using ONLY the rephrased text as your knowledge source.
+                - Answer in the same language as the question/rephrased text.
+                - Do not reference that a rephrased text exists.
+                - For problem sets, provide a complete correct solution.
+                - Do not refer to the chapter, grade or subject in your answer.
+                - Directly start with the answer; no preamble.
 
                 Context:
                 - Subject: {subject}
                 - Grade: {grade}
                 - Chapter: {chapter_title}
-                - Text: {text}
+                - Rephrased Text: {rephraser}
 
                 Create an answer that:
                 1. Demonstrates understanding of the key concepts
-                2. Uses evidence from the text but no need to cite the source
+                2. Is grounded in the rephrased text (no external facts)
                 3. Is appropriate for the grade level
                 4. Provides clear explanations
-                5. Includes relevant examples
+                5. Includes relevant examples or steps
 
-                Generate a sample educational answer that could be used to test student understanding.
-
-                Here's the generated question based on the chapter chunk:
+                Here's the generated question:
                 - {questioner}
                 """,
                 run_full_episode=False
@@ -335,15 +448,18 @@ class TextbookQAGenerator:
                 environment_name="default",
                 tools=[judge_tool],
                 subtask="""
-                Evaluate the quality and educational value of the generated content.
-                - Use the provided context and the previously generated question and answer (available in the chat history)
-                - Produce structured metrics by calling the `judge_metrics` tool exactly once.
+                Evaluate the quality and educational value of the generated Q/A. 
+                - Use the REPHRASED text as the primary grounding source
+                - The ORIGINAL text is provided for tie-breaks and factual checks.
+                - You MUST call the `judge_metrics` tool exactly once, returning all required fields.
+                - A score of 10 for any metric should only be awarded for perfect answers
 
-                Context:
-                - Subject: {subject}
-                - Grade: {grade}
-                - Chapter: {chapter_title}
-                - Text: {text}
+                Primary Grounding:
+                - Rephrased Text: {rephraser}
+
+                Reference (for verification only, do not penalize for faithful rephrasing):
+                - Original Text: {text}
+
                 Generated Question: {questioner}
                 Generated Answer: {answerer}
 
@@ -354,14 +470,11 @@ class TextbookQAGenerator:
                 - factual_correctness
                 - language_quality
 
-                You MUST return all five metric values and `feedback` via the `judge_metrics` tool in a single call. All five metrics are required and must be numbers between 0 and 10.
+                Return all five numeric metrics and brief `feedback` via a single `judge_metrics` tool call.
                 """,
                 run_full_episode=False
             )
         ]
-
-        # For now, let's use a simple workflow without MCP servers
-        # We'll create a basic workflow that can execute the steps
 
         return Workflow(
             name="textbook_qa_workflow",
@@ -381,7 +494,7 @@ class TextbookQAGenerator:
             Text: {text}
             """,
             steps=steps,
-            mcp_servers=self.mcp_servers  # Use the chat environment we created
+            mcp_servers=self._setup_mcp_servers()
         )
     
     async def generate_qa_for_chunk(
@@ -393,11 +506,28 @@ class TextbookQAGenerator:
 
         logger.info(f"Generating QA for chunk {chunk.id}: {chunk.subject} - {chunk.chapter_title}")
 
+        # Ensure no global tools bleed into steps; judge tool should be step-scoped only
+        try:
+            ct = getattr(agent, "chat_thread", None)
+            if ct is not None:
+                # Clear any lingering tools from previous runs/batches
+                if hasattr(ct, "tools"):
+                    ct.tools = []
+                # Reset any step index bookkeeping if present
+                if hasattr(ct, "workflow_step"):
+                    ct.workflow_step = None
+        except Exception:
+            pass
+
         # Create workflow
         workflow = self.create_textbook_qa_workflow()
 
         # Prepare inputs
         inputs = chunk.to_workflow_inputs()
+        # Minimal propagation of chapter_title
+        inputs["chapter_title"] = getattr(chunk, "chapter_title", "")
+        # Propagate source into workflow inputs
+        inputs["source"] = getattr(chunk, "source", "")
 
         try:
             # Execute workflow
@@ -421,8 +551,21 @@ class TextbookQAGenerator:
                 "workflow_results": wf_dump,
                 "execution_time": execution_time,
                 "timestamp": datetime.now().isoformat(),
-                "metadata": chunk.metadata
+                "metadata": {
+                    **(chunk.metadata or {}),
+                    "chapter_title": chunk.chapter_title
+                }
             }
+
+            # Incremental persistence: append raw result and ShareGPT item as they complete
+            try:
+                self._ensure_run_files()
+                sharegpt_item = self._to_sharegpt_item(result)
+                await self._append_jsonl(self.results_jsonl_path, result)
+                await self._append_jsonl(self.sharegpt_jsonl_path, sharegpt_item)
+                logger.info(f"Appended JSONL for chunk {chunk.id} -> {self.results_jsonl_path.name}, {self.sharegpt_jsonl_path.name}")
+            except Exception as io_err:
+                logger.error(f"Failed incremental save for chunk {chunk.id}: {io_err}")
 
             logger.info(f"Successfully generated QA for chunk {chunk.id}")
             return result
@@ -438,7 +581,8 @@ class TextbookQAGenerator:
     async def generate_dataset(
         self,
         agent: MarketAgent,
-        max_workers: int = 1
+        max_workers: int = 1,
+        agent_factory: Optional[callable] = None
     ) -> List[Dict[str, Any]]:
         """Generate QA dataset from all loaded chunks with bounded parallelism"""
         # Load chunks
@@ -448,16 +592,20 @@ class TextbookQAGenerator:
             chunks = chunks[: self.num_samples]
         total = len(chunks)
         workers = max(1, int(max_workers or getattr(self, 'batch_size', 1)))
+        # Prepare per-run jsonl files for incremental saves
+        self._ensure_run_files()
+        logger.info(f"Incremental save paths: results={self.results_jsonl_path.name}, sharegpt={self.sharegpt_jsonl_path.name}")
         logger.info(f"Starting QA generation for {total} chunks (parallel batch_size={workers})")
-
-        import asyncio
-        from datetime import datetime
-        from minference.lite.inference import InferenceOrchestrator
-        from market_agents.agents.market_agent import MarketAgent as _MA
 
         sem = asyncio.Semaphore(workers)
 
-        def spawn_agent() -> MarketAgent:
+        # Agent factory: prefer external factory if provided (e.g., setup_market_agent from run_sample_qa)
+        def new_agent() -> MarketAgent:
+            if agent_factory is not None:
+                return agent_factory()
+            # Fallback: construct a fresh agent with the same config as the template
+            from minference.lite.inference import InferenceOrchestrator
+            from market_agents.agents.market_agent import MarketAgent as _MA
             llm_orch = InferenceOrchestrator()
             return _MA(
                 name=getattr(agent, 'name', 'textbook_qa_worker'),
@@ -471,7 +619,7 @@ class TextbookQAGenerator:
 
         async def process_one(idx: int, chunk) -> Dict[str, Any]:
             async with sem:
-                local_agent = spawn_agent()
+                local_agent = new_agent()
                 try:
                     coro = self.generate_qa_for_chunk(chunk, local_agent)
                     timeout = max(1, int(getattr(self, 'per_task_timeout', 300)))
@@ -526,7 +674,7 @@ class TextbookQAGenerator:
         
         logger.info(f"Saved results to {full_results_file}")
         logger.info(f"Saved summary to {summary_file}")
-        
+        logger.info(f"Incremental JSONL files already contain per-sample records: {self.results_jsonl_path}, {self.sharegpt_jsonl_path}")
         # Also save in ShareGPT format for multi-turn QA datasets
         sharegpt_file = self.output_dir / f"textbook_qa_sharegpt_{timestamp}.json"
         self.save_sharegpt_dataset(results, sharegpt_file.name)
@@ -546,6 +694,7 @@ class TextbookQAGenerator:
                 qa = result['qa_conversation']
                 question = qa.get('question') or '"प्रश्न प्रस्तावत हुन्छ?"'
                 answer = qa.get('answer') or ''
+                rephrased_text = qa.get('rephrased_text') or ''
                 metrics = qa.get('metrics') or ''
                 feedback = qa.get('feedback') or ''
                 quality_score = qa.get('quality_score')
@@ -567,11 +716,12 @@ class TextbookQAGenerator:
                     "metadata": {
                         "subject": result['subject'],
                         "grade": result['grade'],
-                        "chapter_title": result['chapter_title'],
-                        "source": result['source'],
+                        "chapter_title": result.get("chapter_title", ""),
+                        "source": (result.get('source') or (result.get('metadata', {}) or {}).get('source') or ""),
                         "execution_time": result.get('execution_time', 0),
                         "timestamp": result.get('timestamp', ''),
                         "context_text": result.get('original_text', ''),
+                        "rephrased_text": rephrased_text,
                         "feedback": feedback,
                         "llm_judge_metrics": metrics,
                         "average_score": quality_score
