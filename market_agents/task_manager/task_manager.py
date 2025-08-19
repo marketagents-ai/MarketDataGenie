@@ -24,6 +24,21 @@ class TaskManager:
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.execution_history: List[TaskExecutionResult] = []
+
+
+    def _coerce_int(self, v: Any, default: int = 0) -> int:
+        try:
+            if isinstance(v, bool):
+                return default
+            if isinstance(v, (int, float)):
+                return int(v)
+            if isinstance(v, str):
+                s = v.strip()
+                if s.isdigit() or (s.startswith('-') and s[1:].isdigit()):
+                    return int(s)
+            return default
+        except Exception:
+            return default
     
     def load_tasks_from_csv(self, filename: str, num_tasks: Optional[int] = None) -> List[Task]:
         """Load tasks from CSV file (datagenie style)"""
@@ -72,7 +87,7 @@ class TaskManager:
         return tasks
     
     def load_textbook_chunks_from_csv(self, filename: str, num_chunks: Optional[int] = None) -> List[TextbookChunk]:
-        """Load textbook chunks from CSV file (HuggingFace dataset format)"""
+        """Load textbook chunks from CSV file (HuggingFace dataset format) with pragmatic column resolution"""
         file_path = self.base_path / filename
         
         if not file_path.exists():
@@ -81,19 +96,26 @@ class TaskManager:
         chunks = []
         with open(file_path, 'r', encoding='utf-8') as csv_file:
             reader = csv.DictReader(csv_file, skipinitialspace=True)
-            
+            available = reader.fieldnames or []
+            text_col    = self._resolve_column(available, 'text',    ['content','body','passage','context','raw_text'])
+            subject_col = self._resolve_column(available, 'subject', ['course','topic','subject_name'])
+            grade_col   = self._resolve_column(available, 'grade',   ['class','std','level','grade_level'])
+            source_col  = self._resolve_column(available, 'source',  ['book','dataset','corpus'])
+            id_col      = self._resolve_column(available, 'id',      ['_id','uuid','doc_id','row_id'])
+            chap_idx_col= self._resolve_column(available, 'chapter_index', ['seg_index','segment_index','chunk_index','page_index'])
+            chap_title_col = self._resolve_column(available, 'chapter_title', ['chapter','unit','unit_title','lesson','topic_title','heading'])
+            logger.info(f"CSV column mapping: id={id_col}, text={text_col}, subject={subject_col}, grade={grade_col}, chapter_title={chap_title_col}, chapter_index={chap_idx_col}, source={source_col}")
             for i, row in enumerate(reader):
                 if num_chunks and i >= num_chunks:
                     break
-                
                 chunk = TextbookChunk(
-                    id=row.get('id', f"chunk_{i+1}"),
-                    text=row.get('text', ''),
-                    source=row.get('source', ''),
-                    subject=row.get('subject', ''),
-                    grade=int(row.get('grade', 12)),
-                    chapter_index=int(row.get('chapter_index', 1)),
-                    chapter_title=row.get('chapter_title', ''),
+                    id=row.get(id_col) or f"chunk_{i+1}",
+                    text=row.get(text_col, '') if text_col else '',
+                    source=row.get(source_col, '') if source_col else '',
+                    subject=row.get(subject_col, '') if subject_col else '',
+                    grade=self._coerce_int(row.get(grade_col)) if grade_col else 0,
+                    chapter_index=self._coerce_int(row.get(chap_idx_col)) if chap_idx_col else 0,
+                    chapter_title=row.get(chap_title_col, '') if chap_title_col else '',
                     metadata={'source': 'csv', 'original_row': row}
                 )
                 chunks.append(chunk)
@@ -110,7 +132,7 @@ class TaskManager:
         split: str = "train",
         schema: Optional[Dict[str, str]] = None
     ) -> List[TextbookChunk]:
-        """Load textbook chunks from HuggingFace dataset, honoring optional column schema mapping and split"""
+        """Load textbook chunks from HuggingFace dataset, using only the provided schema mapping (no fallback)."""
         if not dataset_name:
             raise ValueError("dataset_name is required")
         try:
@@ -120,65 +142,51 @@ class TaskManager:
 
         logger.info(f"Loading HuggingFace dataset: {dataset_name} (split={split})")
 
-        # Load dataset/split
         dataset = load_dataset(dataset_name, split=split)
-
-        # Only prompt-relevant fields are required; others are optional/defaulted
-        mapping = {
-            'text': 'text',
-            'subject': 'subject',
-            'grade': 'grade',
-            'chapter_title': 'chapter_title'
-        }
-        if schema:
-            mapping.update(schema)
+        available = list(dataset.column_names)
+        mapping = dict(schema or {})
+        logger.info(f"HF column mapping (config-only): {mapping} | available={available}")
 
         def col(row: Dict[str, Any], key: str, default: Any = None):
             src = mapping.get(key)
-            if src is None:
-                return default
-            return row.get(src, default)
+            return row.get(src, default) if src else default
 
-        # Convert to TextbookChunk objects
         chunks: List[TextbookChunk] = []
         for i, row in enumerate(dataset):
             if num_chunks and len(chunks) >= num_chunks:
                 break
-
             try:
-                # Minimal required fields for prompts
                 text_val = str(col(row, 'text', ''))
                 subject_val = str(col(row, 'subject', ''))
-                grade_val = col(row, 'grade', 0)
+                grade_val_raw = col(row, 'grade', 0)
+                grade_val = self._coerce_int(grade_val_raw, 0)
                 chapter_title_val = str(col(row, 'chapter_title', ''))
-
-                row_subject = subject_val
-                row_grade_int = int(grade_val) if isinstance(grade_val, (int, str)) and str(grade_val).isdigit() else None
-                if subjects and row_subject not in subjects:
+                chapter_index_val = self._coerce_int(col(row, 'chapter_index', 0), 0)
+                source_val = str(col(row, 'source', ''))
+                id_val = str(col(row, 'id', f"chunk_{i+1}"))
+                if subjects and subject_val not in subjects:
                     continue
-                if grades and row_grade_int is not None and row_grade_int not in grades:
+                if grades and grade_val not in grades:
                     continue
-
                 chunk = TextbookChunk(
-                    id=str(row.get('id', f"chunk_{i+1}")),
+                    id=id_val,
                     text=text_val,
-                    source=str(row.get('source', '')),
+                    source=source_val,
                     subject=subject_val,
-                    grade=int(grade_val) if grade_val is not None and str(grade_val).isdigit() else 0,
-                    chapter_index=int(row.get('chapter_index', 0) or 0),
+                    grade=grade_val,
+                    chapter_index=chapter_index_val,
                     chapter_title=chapter_title_val,
                     metadata={
                         'dataset_source': dataset_name,
                         'dataset_split': split,
-                        'schema_mapping': mapping
+                        'schema_mapping': mapping,
+                        'available_columns': available
                     }
                 )
             except Exception as e:
                 logger.warning(f"Skipping row {i} due to schema conversion error: {e}")
                 continue
-
             chunks.append(chunk)
-
         logger.info(f"Loaded {len(chunks)} textbook chunks from HuggingFace dataset")
         return chunks
     
@@ -290,7 +298,7 @@ class TaskManager:
                     run_full_episode=False
                 ),
                 WorkflowStepConfig(
-                    name="reader",
+                    name="rephraser",
                     environment_name="textbook_qa",
                     tools=["evidence_retrieval_tool"],
                     subtask="Retrieve evidence from source text for the question",
