@@ -45,6 +45,7 @@ def setup_market_agent() -> MarketAgent:
         the cultural and linguistic nuances required for effective learning content.
         """,
         objectives=[
+            "Rephrase existing text in an infromation dense educational content"
             "Create educationally valuable QA conversations",
             "Ensure grade-appropriate content and language",
             "Maintain high quality and accuracy standards",
@@ -62,8 +63,8 @@ def setup_market_agent() -> MarketAgent:
         model="Hermes-3-Llama-3.1-405B",
         #client="openai",
         #model="gpt-5-nano",
-        temperature=0.5,
-        max_tokens=4096
+        temperature=0.4,
+        max_tokens=8192
     )
     
     # Setup LLM orchestrator
