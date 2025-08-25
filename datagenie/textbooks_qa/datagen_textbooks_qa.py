@@ -21,19 +21,17 @@ import asyncio
 from typing import Dict, List, Any, Optional, Union
 from datetime import datetime
 from pathlib import Path
+from datasets import load_dataset
+
+import yaml
 import re
+import hashlib
+import random
+import tiktoken
 
 # Additional imports for pydantic tool schema
 from pydantic import BaseModel, Field
 from minference.lite.models import StructuredTool
-
-# YAML config support
-try:
-    import yaml
-except ImportError:
-    yaml = None
-
-
 
 # MarketAgents imports
 from market_agents.agents.market_agent import MarketAgent
@@ -46,7 +44,6 @@ from market_agents.task_manager import (
     TextbookChunk
 )
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +52,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Validated few shot examples to add to prompt from recently generated batch
+def _pick_dynamic_example(batch_results: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """
+    From a batch of `generate_qa_for_chunk` results, pick the highest-quality valid example.
+    Returns dict with 'question' and 'answer' keys (and ignores if invalid).
+    """
+    candidates = []
+    for r in batch_results:
+        try:
+            qa = r.get("qa_conversation") or {}
+            q = (qa.get("question") or "").strip()
+            a = (qa.get("answer") or "").strip()
+            rp = (qa.get("rephrased_text") or "").strip()
+            score = qa.get("quality_score")
+            score_val = float(score) if score is not None else 0.0
+            candidates.append((score_val, {"question": q, "answer": a}))
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    # Pick by highest score, fall back to first if ties
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
 # Pydantic model for judge metrics (all fields REQUIRED)
 class JudgeMetrics(BaseModel):
     grounded_in_context: float = Field(..., ge=0.0, le=10.0, description="Whether answer is grounded in the context of the provided text")
@@ -62,7 +83,6 @@ class JudgeMetrics(BaseModel):
     answer_query_relevance: float = Field(..., ge=0.0, le=10.0, description="How relevant the answer is to the provided text")
     factual_correctness: float = Field(..., ge=0.0, le=10.0, description="How factually correct is the answer?")
     language_quality: float = Field(..., ge=0.0, le=10.0, description="Grammar and language quality")
-    feedback: str = Field(..., description="Short feedback on the textbook Q/A pair")
 
 class TextbookQAGenerator:
     """
@@ -90,6 +110,10 @@ class TextbookQAGenerator:
         self.schema_mapping: Dict[str, str] = schema_mapping or {}
         self.dataset_split: str = "train"
 
+        # Optional: previously generated HF dataset to skip duplicates
+        self.generated_dataset_name: Optional[str] = None
+        self.generated_dataset_split: str = "train"
+
         if config_path:
             if yaml is None:
                 raise ImportError("PyYAML is required to use config files. Install with: pip install pyyaml")
@@ -108,6 +132,11 @@ class TextbookQAGenerator:
             self.dataset_name = ds_cfg.get('name', self.dataset_name)
             self.dataset_split = ds_cfg.get('split', self.dataset_split)
 
+            # Previously generated dataset (for dedup/filtering)
+            gen_ds_cfg = (cfg.get('generated_dataset') or {})
+            self.generated_dataset_name = gen_ds_cfg.get('name') or self.generated_dataset_name
+            self.generated_dataset_split = gen_ds_cfg.get('split', self.generated_dataset_split)
+
             # Filters and limits
             self.num_samples = gen_cfg.get('num_samples', self.num_samples)
             self.subjects = gen_cfg.get('subjects', self.subjects)
@@ -116,6 +145,15 @@ class TextbookQAGenerator:
             # Parallel rollout controls
             self.batch_size = int(gen_cfg.get('batch_size', 1))
             self.per_task_timeout = int(gen_cfg.get('per_task_timeout', 300))
+
+            # Minimal retry-until-complete controller
+            self.retry_until_complete: bool = bool(gen_cfg.get('retry_until_complete', False))
+            self.completed_state_file: str = str(gen_cfg.get('completed_state_file', str(Path(self.output_dir) / "completed_state.json")))
+
+            # Tokenization & truncation controls
+            self.model_encoding: str = str(gen_cfg.get("model_encoding", "cl100k_base"))
+            # Hard token cap for the raw input text fed into the workflow (rephraser step)
+            self.max_input_tokens: int = int(gen_cfg.get("max_input_tokens", 12000))
 
             # Output dir
             self.output_dir = Path(cfg.get('output_dir', output_dir))
@@ -132,6 +170,16 @@ class TextbookQAGenerator:
             self.batch_size = 1
         if not hasattr(self, 'per_task_timeout'):
             self.per_task_timeout = 300
+        if not hasattr(self, 'retry_until_complete'):
+            self.retry_until_complete = False
+        if not hasattr(self, 'completed_state_file'):
+            self.completed_state_file = str(Path(self.output_dir) / "completed_state.json")
+
+        # Ensure safe defaults for tokenization/truncation controls
+        if not hasattr(self, "model_encoding"):
+            self.model_encoding = "cl100k_base"
+        if not hasattr(self, "max_input_tokens"):
+            self.max_input_tokens = 12000
 
         # Initialize components
         self.task_manager = TaskManager()
@@ -147,6 +195,137 @@ class TextbookQAGenerator:
         self.sharegpt_jsonl_path: Optional[Path] = None
         self._io_lock: Optional[asyncio.Lock] = None
 
+        # Optional: few-shot example for question/answer style guidance
+        self.example_qa: Optional[Dict[str, str]] = None
+        try:
+            example_path = Path("configs/example.json")
+            if example_path.exists():
+                with open(example_path, "r", encoding="utf-8") as ef:
+                    data = json.load(ef) or {}
+                q = (data.get("question") or "").strip()
+                a = (data.get("answer") or "").strip()
+                if q and a:
+                    self.example_qa = {"question": q, "answer": a}
+                    logger.info("Loaded example Q/A from configs/example.json for few-shot guidance.")
+                else:
+                    logger.warning("configs/example.json found but missing non-empty 'question'/'answer'. Ignoring.")
+        except Exception as ex:
+            logger.warning(f"Failed to load configs/example.json: {ex}")
+
+        # Optional: banned phrases (chapter-anchoring leaks) from YAML or JSON
+        self.banned_phrases: List[str] = []
+        try:
+            banned_yml = Path("configs/banned_phrases.yml")
+            banned_json = Path("configs/banned_phrases.json")
+            phrases: List[str] = []
+            if banned_yml.exists() and yaml is not None:
+                with open(banned_yml, "r", encoding="utf-8") as bf:
+                    data = yaml.safe_load(bf) or {}
+                phrases = list(data.get("banned_phrases") or [])
+            elif banned_json.exists():
+                with open(banned_json, "r", encoding="utf-8") as bf:
+                    data = json.load(bf) or {}
+                phrases = list(data.get("banned_phrases") or [])
+            # normalize + dedupe
+            norm = []
+            seen = set()
+            for p in phrases:
+                if not isinstance(p, str):
+                    continue
+                s = p.strip()
+                if not s or s in seen:
+                    continue
+                seen.add(s)
+                norm.append(s)
+            self.banned_phrases = norm
+            if self.banned_phrases:
+                logger.info(f"Loaded {len(self.banned_phrases)} banned phrases for leakage prevention.")
+        except Exception as ex:
+            logger.warning(f"Failed to load banned phrases: {ex}")
+
+    @staticmethod
+    def _normalize_for_hash(text: str) -> str:
+        # Minimal, language-agnostic normalization: trim, collapse whitespace
+        t = (text or "").strip()
+        t = re.sub(r"\s+", " ", t)
+        return t
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        norm = TextbookQAGenerator._normalize_for_hash(text)
+        return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+    def _get_encoder(self):
+        """
+        Return a tiktoken encoding. Falls back to cl100k_base if model-specific encoding is unavailable.
+        If tiktoken is missing, returns None and token functions will degrade gracefully.
+        """
+        if tiktoken is None:
+            logger.warning("tiktoken not installed; token counting will be disabled.")
+            return None
+        try:
+            return tiktoken.get_encoding(self.model_encoding)
+        except Exception:
+            try:
+                return tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                logger.warning("Failed to acquire tiktoken encoder; token counting disabled.")
+                return None
+
+    def _count_tokens(self, text: str) -> int:
+        enc = self._get_encoder()
+        if enc is None:
+            # Rough fallback: 4 chars per token heuristic
+            return max(1, (len(text or "") // 4))
+        try:
+            return len(enc.encode(text or ""))
+        except Exception:
+            return max(1, (len(text or "") // 4))
+
+    def _truncate_by_tokens(self, text: str, max_tokens: int) -> str:
+        """
+        Truncate a string to at most `max_tokens` tokens using tiktoken.
+        If tiktoken is unavailable, fall back to a rough character cut.
+        """
+        if not isinstance(text, str):
+            return ""
+        if max_tokens <= 0:
+            return ""
+        enc = self._get_encoder()
+        if enc is None:
+            approx_chars = max_tokens * 4
+            return text[:approx_chars]
+        toks = enc.encode(text)
+        if len(toks) <= max_tokens:
+            return text
+        truncated = enc.decode(toks[:max_tokens])
+        return truncated
+
+    def _load_existing_hashes(self) -> Optional[set]:
+        """
+        Load hashes of context_text from the previously generated HF dataset.
+        Returns a set of sha256 hashes, or None if not configured/available.
+        """
+        if not self.generated_dataset_name:
+            return None
+        try:
+            logger.info(f"Loading existing generated dataset for dedup: {self.generated_dataset_name} [{self.generated_dataset_split}]")
+            # Stream to avoid loading entire dataset into memory
+            ds_iterable = load_dataset(self.generated_dataset_name, split=self.generated_dataset_split, streaming=True)
+            seen = set()
+            count = 0
+            for ex in ds_iterable:
+                ctx = ex.get("context_text") or ""
+                if ctx:
+                    h = self._hash_text(ctx)
+                    seen.add(h)
+                    count += 1
+            logger.info(f"Prepared {len(seen)} existing-context hashes from generated dataset (scanned {count} rows).")
+            return seen
+        except Exception as e:
+            logger.warning(f"Failed to load existing generated dataset for dedup: {e}")
+            return None
+
     def _ensure_run_files(self):
         """Ensure per-run jsonl file paths are initialized and files exist."""
         if not self.run_timestamp:
@@ -161,6 +340,36 @@ class TextbookQAGenerator:
         self.sharegpt_jsonl_path.touch(exist_ok=True)
         if self._io_lock is None:
             self._io_lock = asyncio.Lock()
+
+    def _completed_state_path(self) -> Path:
+        return Path(self.completed_state_file)
+
+    def _done_key(self, chunk_id: str, chapter_title: Optional[str]) -> str:
+        base = f"{chunk_id}||{(chapter_title or '').strip()}"
+        return hashlib.sha1(base.encode('utf-8')).hexdigest()
+
+    def _load_completed(self) -> set:
+        p = self._completed_state_path()
+        try:
+            if p.exists():
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return set(data)
+                if isinstance(data, set):
+                    return data
+        except Exception as e:
+            logger.warning(f"Failed to load completed state from {p}: {e}")
+        return set()
+
+    def _save_completed(self, completed: set):
+        p = self._completed_state_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(sorted(list(completed)), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save completed state to {p}: {e}")
 
     async def _append_jsonl(self, path: Path, obj: Dict[str, Any]):
         """Append a single JSON object as a line to a JSONL file with async lock to avoid interleaving."""
@@ -178,9 +387,10 @@ class TextbookQAGenerator:
         question = qa.get('question') or '"प्रश्न प्रस्तावत हुन्छ?"'
         answer = qa.get('answer') or ''
         rephrased_text = qa.get('rephrased_text') or ''
-        metrics = qa.get('metrics') or ''
+        # Populate nulls when judge didn't run
+        metrics = qa.get('metrics') if qa.get('metrics') is not None else None
         feedback = qa.get('feedback') or ''
-        quality_score = qa.get('quality_score')
+        quality_score = qa.get('quality_score') if qa.get('quality_score') is not None else None
         item = {
             "id": result['chunk_id'],
             "conversations": [
@@ -202,6 +412,33 @@ class TextbookQAGenerator:
             }
         }
         return item
+
+    def _is_valid_sharegpt(self, item: Dict[str, Any]) -> bool:
+        """
+        Validate minimal requirements for ShareGPT saving.
+        Rule: question, answer, and rephrased_text must be present and non-empty.
+        Exception: judge metrics may be missing.
+        """
+        try:
+            if not isinstance(item, dict):
+                return False
+            conv = item.get("conversations") or []
+            if not isinstance(conv, list) or len(conv) < 2:
+                return False
+            q = (conv[0] or {}).get("value") if isinstance(conv[0], dict) else None
+            a = (conv[1] or {}).get("value") if isinstance(conv[1], dict) else None
+            if not isinstance(q, str) or not q.strip():
+                return False
+            if not isinstance(a, str) or not a.strip():
+                return False
+            md = item.get("metadata") or {}
+            r = md.get("rephrased_text")
+            if not isinstance(r, str) or not r.strip():
+                return False
+            # subject, grade, chapter_title, source should exist but we won't fail hard if absent here
+            return True
+        except Exception:
+            return False
 
     def _is_frontmatter(self, title: Optional[str]) -> bool:
         t = (title or "").strip().lower()
@@ -341,6 +578,23 @@ class TextbookQAGenerator:
         skipped = before - len(chunks)
         if skipped:
             logger.info(f"Skipped {skipped} front-matter chunks (Chapter 0 / Preface / Frontmatter).")
+        # Optional: filter out chunks that already exist in previously generated dataset
+        existing_hashes = self._load_existing_hashes()
+        if existing_hashes:
+            before_dedup = len(chunks)
+            filtered = []
+            for c in chunks:
+                try:
+                    h = self._hash_text(getattr(c, "text", "") or "")
+                    if h not in existing_hashes:
+                        filtered.append(c)
+                except Exception:
+                    # If hashing fails for any reason, keep the sample to avoid accidental drops
+                    filtered.append(c)
+            dropped = before_dedup - len(filtered)
+            if dropped > 0:
+                logger.info(f"Dedup filter: skipped {dropped} chunks already present in generated dataset.")
+            chunks = filtered
         return chunks
     
     def create_textbook_qa_workflow(self) -> Workflow:
@@ -354,32 +608,54 @@ class TextbookQAGenerator:
         )
         logger.info("Judge step uses StructuredTool; ensure the agent's LLM config supports tool use (e.g., ResponseFormat.auto_tools)")
 
+        example_block = ""
+        if getattr(self, "example_qa", None):
+            ex_q = self.example_qa.get("question", "")
+            ex_a = self.example_qa.get("answer", "")
+            example_block = f"""
+                Few-shot style guidance (do NOT copy; only mirror clarity and structure):
+                - Example Question: {ex_q}
+                - Example Answer: {ex_a}
+            """.strip()
+
+        banned_block = ""
+        if getattr(self, "banned_phrases", None):
+            # Render as a comma-separated inline list to keep prompts compact
+            banned_inline = ", ".join(self.banned_phrases)
+            banned_block = (
+                "Strictly avoid references to specific chapters/lessons/units and do NOT use any of these phrases: "
+                f"{banned_inline}."
+            )
+
         steps = [
             WorkflowStep(
                 name="rephraser",
                 environment_name="default",
                 tools=[],
-                subtask="""
+                subtask=f"""
                 Rephrase the provided textbook chunk in an word for word, information-dense, pedagogically clear and standalone textbook content.
 
                 Guidelines for rephrasing:
                 - Paraphrase in the same language (with interleaved English) as the original text.
-                - Preserve all factual content from the original text without adding external facts or hallucinations.
+                - Preserve only the factual content from the original text without adding external facts or hallucinations.
+                - Do not mention paricular chapter number, title or author and focus on the educational content.
                 - Increase information density without missing important facts: remove boilerplate, redundancies, asides etc.
                 - Maintain the original language of the text chunk and keep terminology consistent with the subject and grade.
                 - Align to instructional and conversational use: write in a crisp, explanatory tone that is easy to ask/answer questions from.
                 - Define key terms and provide examples; keep symbols, formulas, and units intact.
                 - Avoid references to diagrams or images such as in maths and sciences since this is text only rephrasing.
-                - Fix any OCR junk by correcting the details, equations, notations or the text in original language.
-                - Do not refer to specific chapters or information from the book this chunk belongs to.
+                - Fix any OCR junk by correcting the details, math equations, notations or the text in original language.
                 - The text chunk is split from the whole chapter so make the rephrased content as coherent as possible.
                 - Directly output ONLY the rephrased text without opening text such as: Here is the rephrased...
+                {banned_block if banned_block else ""}
 
                 Context:
-                - Subject: {subject}
-                - Grade: {grade}
-                - Chapter: {chapter_title}
-                - Original Text: {text}
+                - Subject: {{subject}}
+                - Grade: {{grade}}
+                - Chapter: {{chapter_title}}
+                - Original Text: {{text}}
+
+                Return rephrased text in the same langauge with high quality educational content:
                 """,
                 run_full_episode=False
             ),
@@ -387,22 +663,26 @@ class TextbookQAGenerator:
                 name="questioner",
                 environment_name="default",
                 tools=[],
-                subtask="""
-                Generate an educational question based on the REPHRASED summary produced earlier.
-                - Use the rephrased text as the sole knowledge source.
+                subtask=f"""
+                Generate a problem set or exam question based on the REPHRASED summary of textbook chapter chunk.
+                - Use the rephrased text as the sole knowledge source to generate a closed book exam question.
+                - The question must be answerable even without any additional context.
                 - The question should be in the same language as the rephrased text.
-                - The query should be relevant to the subject, chapter and grade level.
-                - Do not refer to the chapter, grade or subject in your question.
-                - Question should be about the topics not the chapter itself.
-                - For maths/problem-set chunks, recreate a complete solvable question.
+                - The query should be relevant to the topics and informational content only.
+                - Do not metion chapter number, title, author, grade and subject in your question.
+                - For fictitious text such as chunk of story, poems etc, do not ask about the characters or the exact content.
+                - For maths and problem set chunks, recreate a complete solvable question with necessary equations and details.
                 - Questions should not depend on a diagrams such as in sets, geometry, organic chemistry etc.
                 - Directly start with the question without any preamble.
+                - Do not answer the question in this step.
+                {example_block if example_block else ""}
+                {banned_block if banned_block else ""}
 
                 Context:
-                - Subject: {subject}
-                - Grade: {grade}
-                - Chapter: {chapter_title}
-                - Rephrased Text: {rephraser}
+                - Subject: {{subject}}
+                - Grade: {{grade}}
+                - Chapter: {{chapter_title}}
+                - Rephrased Text: {{rephraser}}
 
                 Generate a question that:
                 1. Is appropriate for the grade level
@@ -410,6 +690,8 @@ class TextbookQAGenerator:
                 3. Can be answered using the rephrased text
                 4. Is clear and unambiguous
                 5. Can be answered independent of a particular textbook/chapter
+
+                Generate a complete question in the same langauge without the answer:
                 """,
                 run_full_episode=False
             ),
@@ -417,19 +699,23 @@ class TextbookQAGenerator:
                 name="answerer",
                 environment_name="default",
                 tools=[],
-                subtask="""
+                subtask=f"""
                 Provide a comprehensive answer to the generated question using ONLY the rephrased text as your knowledge source.
                 - Answer in the same language as the question/rephrased text.
-                - Do not reference that a rephrased text exists.
+                - Do not reference that a rephrased text exists and write as if it's an exam question.
                 - For problem sets, provide a complete correct solution.
-                - Do not refer to the chapter, grade or subject in your answer.
+                - Do not metion the chapter number or title, grade, author and subject in your answer.
+                - Your answer should be as descriptive and informative as possible.
+                - If the question is not answerable without additional context please reply with exact phrase: "Question Not Answerable"
                 - Directly start with the answer; no preamble.
+                {example_block if example_block else ""}
+                {banned_block if banned_block else ""}
 
                 Context:
-                - Subject: {subject}
-                - Grade: {grade}
-                - Chapter: {chapter_title}
-                - Rephrased Text: {rephraser}
+                - Subject: {{subject}}
+                - Grade: {{grade}}
+                - Chapter: {{chapter_title}}
+                - Rephrased Text: {{rephraser}}
 
                 Create an answer that:
                 1. Demonstrates understanding of the key concepts
@@ -438,8 +724,8 @@ class TextbookQAGenerator:
                 4. Provides clear explanations
                 5. Includes relevant examples or steps
 
-                Here's the generated question:
-                - {questioner}
+                Here's the generated question you should answer correctly:
+                - {{questioner}}
                 """,
                 run_full_episode=False
             ),
@@ -449,16 +735,13 @@ class TextbookQAGenerator:
                 tools=[judge_tool],
                 subtask="""
                 Evaluate the quality and educational value of the generated Q/A. 
-                - Use the REPHRASED text as the primary grounding source
-                - The ORIGINAL text is provided for tie-breaks and factual checks.
+                - Use the REPHRASED text as the primary grounding source.
                 - You MUST call the `judge_metrics` tool exactly once, returning all required fields.
-                - A score of 10 for any metric should only be awarded for perfect answers
+                - A score of 10 for any metric should only be awarded for perfect answers.
+                - Please be critical while scoring and evaluate properly.
 
                 Primary Grounding:
                 - Rephrased Text: {rephraser}
-
-                Reference (for verification only, do not penalize for faithful rephrasing):
-                - Original Text: {text}
 
                 Generated Question: {questioner}
                 Generated Answer: {answerer}
@@ -470,7 +753,7 @@ class TextbookQAGenerator:
                 - factual_correctness
                 - language_quality
 
-                Return all five numeric metrics and brief `feedback` via a single `judge_metrics` tool call.
+                Return all five numeric metrics via a single `judge_metrics` tool call.
                 """,
                 run_full_episode=False
             )
@@ -524,6 +807,22 @@ class TextbookQAGenerator:
 
         # Prepare inputs
         inputs = chunk.to_workflow_inputs()
+
+        # Token-aware truncation for the main text to avoid context overflows
+        original_text = inputs.get("text", "") or ""
+        orig_tokens = self._count_tokens(original_text)
+        truncated_text = self._truncate_by_tokens(original_text, self.max_input_tokens)
+        trunc_tokens = self._count_tokens(truncated_text)
+        if trunc_tokens < orig_tokens:
+            logger.info(
+                f"Chunk {chunk.id}: text tokens {orig_tokens} > max_input_tokens={self.max_input_tokens}. "
+                f"Truncated to {trunc_tokens} tokens."
+            )
+        else:
+            logger.info(f"Chunk {chunk.id}: text tokens {orig_tokens} within limit {self.max_input_tokens}.")
+
+        inputs["text"] = truncated_text
+
         # Minimal propagation of chapter_title
         inputs["chapter_title"] = getattr(chunk, "chapter_title", "")
         # Propagate source into workflow inputs
@@ -538,6 +837,15 @@ class TextbookQAGenerator:
             # Build structured qa_conversation from workflow outputs
             wf_dump = workflow_result.model_dump(mode='json')
             qa_struct = self._extract_qa_from_workflow(wf_dump)
+
+            try:
+                # Post-hoc token diagnostics for generated fields
+                q_tok = self._count_tokens(qa_struct.get("question", ""))
+                a_tok = self._count_tokens(qa_struct.get("answer", ""))
+                r_tok = self._count_tokens(qa_struct.get("rephrased_text", ""))
+                logger.info(f"Chunk {chunk.id}: tokens — rephrased={r_tok}, question={q_tok}, answer={a_tok}")
+            except Exception:
+                pass
 
             result = {
                 "chunk_id": chunk.id,
@@ -554,7 +862,8 @@ class TextbookQAGenerator:
                 "metadata": {
                     **(chunk.metadata or {}),
                     "chapter_title": chunk.chapter_title
-                }
+                },
+                "sharegpt_valid": False,
             }
 
             # Incremental persistence: append raw result and ShareGPT item as they complete
@@ -562,8 +871,12 @@ class TextbookQAGenerator:
                 self._ensure_run_files()
                 sharegpt_item = self._to_sharegpt_item(result)
                 await self._append_jsonl(self.results_jsonl_path, result)
-                await self._append_jsonl(self.sharegpt_jsonl_path, sharegpt_item)
-                logger.info(f"Appended JSONL for chunk {chunk.id} -> {self.results_jsonl_path.name}, {self.sharegpt_jsonl_path.name}")
+                if self._is_valid_sharegpt(sharegpt_item):
+                    await self._append_jsonl(self.sharegpt_jsonl_path, sharegpt_item)
+                    logger.info(f"Appended JSONL for chunk {chunk.id} -> {self.results_jsonl_path.name}, {self.sharegpt_jsonl_path.name}")
+                    result["sharegpt_valid"] = True
+                else:
+                    logger.warning(f"Invalid ShareGPT item for chunk {chunk.id}; skipping append (missing question/answer/rephrased_text).")
             except Exception as io_err:
                 logger.error(f"Failed incremental save for chunk {chunk.id}: {io_err}")
 
@@ -585,60 +898,124 @@ class TextbookQAGenerator:
         agent_factory: Optional[callable] = None
     ) -> List[Dict[str, Any]]:
         """Generate QA dataset from all loaded chunks with bounded parallelism"""
-        # Load chunks
-        chunks = self.load_huggingface_dataset()
-        # Hard cap to exactly the requested number of samples
+        # Initial load of chunks
+        all_chunks = self.load_huggingface_dataset()
         if self.num_samples is not None:
-            chunks = chunks[: self.num_samples]
-        total = len(chunks)
-        workers = max(1, int(max_workers or getattr(self, 'batch_size', 1)))
+            all_chunks = all_chunks[: self.num_samples]
+        total = len(all_chunks)
+
         # Prepare per-run jsonl files for incremental saves
         self._ensure_run_files()
         logger.info(f"Incremental save paths: results={self.results_jsonl_path.name}, sharegpt={self.sharegpt_jsonl_path.name}")
-        logger.info(f"Starting QA generation for {total} chunks (parallel batch_size={workers})")
 
-        sem = asyncio.Semaphore(workers)
+        # Completed tracker
+        completed_keys = self._load_completed()
+        logger.info(f"Loaded {len(completed_keys)} completed keys from state.")
 
-        # Agent factory: prefer external factory if provided (e.g., setup_market_agent from run_sample_qa)
-        def new_agent() -> MarketAgent:
-            if agent_factory is not None:
-                return agent_factory()
-            # Fallback: construct a fresh agent with the same config as the template
-            from minference.lite.inference import InferenceOrchestrator
-            from market_agents.agents.market_agent import MarketAgent as _MA
-            llm_orch = InferenceOrchestrator()
-            return _MA(
-                name=getattr(agent, 'name', 'textbook_qa_worker'),
-                persona=getattr(agent, 'persona', None),
-                llm_config=getattr(agent, 'llm_config', None),
-                llm_orchestrator=llm_orch,
-                task=getattr(agent, 'task', ''),
-                memory_enabled=getattr(agent, 'memory_enabled', False),
-                verbose=getattr(agent, 'verbose', False)
-            )
+        # Helper to filter pending work
+        def pending_chunks():
+            out = []
+            for c in all_chunks:
+                key = self._done_key(getattr(c, 'id', ''), getattr(c, 'chapter_title', ''))
+                if key not in completed_keys:
+                    out.append(c)
+            return out
 
-        async def process_one(idx: int, chunk) -> Dict[str, Any]:
-            async with sem:
-                local_agent = new_agent()
-                try:
-                    coro = self.generate_qa_for_chunk(chunk, local_agent)
-                    timeout = max(1, int(getattr(self, 'per_task_timeout', 300)))
-                    return await asyncio.wait_for(coro, timeout=timeout)
-                except asyncio.TimeoutError:
-                    logger.error(f"Timeout while generating QA for chunk {getattr(chunk, 'id', idx)} (> {getattr(self, 'per_task_timeout', 300)}s)")
-                    return {"chunk_id": getattr(chunk, 'id', idx), "error": f"timeout > {getattr(self, 'per_task_timeout', 300)}s", "timestamp": datetime.now().isoformat()}
-                except Exception as e:
-                    logger.error(f"Failed to generate QA for chunk {getattr(chunk, 'id', idx)}: {e}")
-                    return {"chunk_id": getattr(chunk, 'id', idx), "error": str(e), "timestamp": datetime.now().isoformat()}
+        pass_idx = 0
+        results: List[Dict[str, Any]] = []
+        workers_cfg = max(1, int(max_workers or getattr(self, 'batch_size', 1)))
 
-        tasks = [asyncio.create_task(process_one(i, c)) for i, c in enumerate(chunks)]
-        results = await asyncio.gather(*tasks)
+        while True:
+            pending = pending_chunks()
+            if not pending:
+                logger.info("No pending chunks remain. All done.")
+                break
 
-        # Save final results
+            pass_idx += 1
+            logger.info(f"Starting pass {pass_idx}: {len(pending)}/{total} pending (configured batch_size={workers_cfg})")
+
+            workers = workers_cfg
+            sem = asyncio.Semaphore(workers)
+
+            # Agent factory
+            def new_agent() -> MarketAgent:
+                if agent_factory is not None:
+                    return agent_factory()
+                from minference.lite.inference import InferenceOrchestrator
+                from market_agents.agents.market_agent import MarketAgent as _MA
+                llm_orch = InferenceOrchestrator()
+                return _MA(
+                    name=getattr(agent, 'name', 'textbook_qa_worker'),
+                    persona=getattr(agent, 'persona', None),
+                    llm_config=getattr(agent, 'llm_config', None),
+                    llm_orchestrator=llm_orch,
+                    task=getattr(agent, 'task', ''),
+                    memory_enabled=getattr(agent, 'memory_enabled', False),
+                    verbose=getattr(agent, 'verbose', False)
+                )
+
+            async def process_one(idx: int, chunk) -> Dict[str, Any]:
+                async with sem:
+                    local_agent = new_agent()
+                    try:
+                        # small jitter to avoid synchronized spikes
+                        await asyncio.sleep(random.uniform(0.0, 0.15))
+                        coro = self.generate_qa_for_chunk(chunk, local_agent)
+                        timeout = max(1, int(getattr(self, 'per_task_timeout', 300)))
+                        return await asyncio.wait_for(coro, timeout=timeout)
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout while generating QA for chunk {getattr(chunk, 'id', idx)} (> {getattr(self, 'per_task_timeout', 300)}s)")
+                        return {"chunk_id": getattr(chunk, 'id', idx), "error": f"timeout > {getattr(self, 'per_task_timeout', 300)}s", "timestamp": datetime.now().isoformat()}
+                    except Exception as e:
+                        logger.error(f"Failed to generate QA for chunk {getattr(chunk, 'id', idx)}: {e}")
+                        return {"chunk_id": getattr(chunk, 'id', idx), "error": str(e), "timestamp": datetime.now().isoformat()}
+
+            batch_results: List[Dict[str, Any]] = []
+            # Process this pass in batches of size `workers`
+            for start in range(0, len(pending), workers):
+                end = min(start + workers, len(pending))
+                batch_chunks = pending[start:end]
+                logger.info(f"Pass {pass_idx} - processing chunks {start}..{end-1} of {len(pending)}")
+                tasks = [asyncio.create_task(process_one(i, c)) for i, c in enumerate(batch_chunks, start=start)]
+                out = await asyncio.gather(*tasks)
+                batch_results.extend(out)
+
+                # Try to update few-shot example for next mini-batch
+                dyn_ex = _pick_dynamic_example(out)
+                if dyn_ex:
+                    self.example_qa = dyn_ex
+
+                # Mark successful ones as completed and persist state
+                newly_completed = 0
+                for res, ch in zip(out, batch_chunks):
+                    try:
+                        if res.get("sharegpt_valid"):
+                            key = self._done_key(getattr(ch, 'id', ''), getattr(ch, 'chapter_title', ''))
+                            if key not in completed_keys:
+                                completed_keys.add(key)
+                                newly_completed += 1
+                    except Exception:
+                        continue
+                if newly_completed:
+                    self._save_completed(completed_keys)
+                    logger.info(f"Pass {pass_idx}: marked {newly_completed} newly completed samples (total completed {len(completed_keys)}/{total}).")
+
+            results.extend(batch_results)
+
+            # Stop after one pass if retry_until_complete is false
+            if not self.retry_until_complete:
+                logger.info("retry_until_complete is disabled. Stopping after first pass.")
+                break
+
+            # If this pass made no progress, bail to avoid infinite loops
+            if not any(r.get("sharegpt_valid") for r in batch_results):
+                logger.warning("No successful samples in this pass. Stopping to avoid infinite retries.")
+                break
+
+        # Save final results summary
         self.results = results
         self.save_results(results)
-
-        logger.info(f"Completed QA generation. Generated {len(results)} QA conversations")
+        logger.info(f"Completed QA generation over {pass_idx} pass(es). Generated {sum(1 for r in results if r.get('sharegpt_valid'))} valid ShareGPT conversations.")
         return results
     
     def save_intermediate_results(self, results: List[Dict[str, Any]], filename: str):
@@ -695,9 +1072,10 @@ class TextbookQAGenerator:
                 question = qa.get('question') or '"प्रश्न प्रस्तावत हुन्छ?"'
                 answer = qa.get('answer') or ''
                 rephrased_text = qa.get('rephrased_text') or ''
-                metrics = qa.get('metrics') or ''
+                # Populate nulls when judge didn't run so JSON shows `null`
+                metrics = qa.get('metrics') if qa.get('metrics') is not None else None
                 feedback = qa.get('feedback') or ''
-                quality_score = qa.get('quality_score')
+                quality_score = qa.get('quality_score') if qa.get('quality_score') is not None else None
 
                 # Build minimal two-turn conversation per ShareGPT: human asks, assistant answers.
                 # Context text and other fields are stored in metadata.
@@ -727,7 +1105,10 @@ class TextbookQAGenerator:
                         "average_score": quality_score
                     }
                 }
-                sharegpt_data.append(conversation)
+                if self._is_valid_sharegpt(conversation):
+                    sharegpt_data.append(conversation)
+                else:
+                    logger.warning(f"Invalid ShareGPT item for chunk {result.get('chunk_id')}; excluded from final dataset.")
 
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(sharegpt_data, f, ensure_ascii=False, indent=2)
