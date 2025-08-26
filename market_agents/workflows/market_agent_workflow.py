@@ -684,7 +684,22 @@ class Workflow(Entity):
                 logger.debug(f"Updated state after {step.name}: {state}")
             else:
                 logger.error(f"Step '{step.name}' failed: {step_result.error}")
+                # Record failure details in state and terminate workflow execution
+                state = _json_safe(state)
+                state["__failed__"] = True
+                state["__failed_step__"] = step.name
+                state["__error__"] = step_result.error or (
+                    step_result.result.metadata.get("error")
+                    if hasattr(step_result, "result") and hasattr(step_result.result, "metadata")
+                    else "Unknown error"
+                )
                 results.append(step_result)
+                # Stop executing remaining steps
+                break
+
+        # Log if workflow terminated early due to failure
+        if state.get("__failed__"):
+            logger.debug(f"[Workflow] terminated early at step '{state.get('__failed_step__')}' due to error: {state.get('__error__')}")
 
         # Collect tool history only from available MCP servers
         tool_history = {}

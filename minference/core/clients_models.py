@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import  Optional, Union, Dict, List, Any
+from typing import Optional, Union, Dict, List, Any, Literal
 
 from openai.types.chat import (
     ChatCompletionMessageParam,
@@ -32,6 +32,10 @@ from anthropic.types import (
 from anthropic.types.model_param import ModelParam
 
 
+class ReasoningConfig(BaseModel):
+    effort: Optional[Literal["minimal","low","medium","high"]] = Field(default=None)
+
+
 class OpenAIRequest(BaseModel):
     messages: List[ChatCompletionMessageParam]
     model: str
@@ -40,6 +44,7 @@ class OpenAIRequest(BaseModel):
     functions: Optional[List[FunctionDefinition]] = Field(default=None)
     logit_bias: Optional[Dict[str, int]] = Field(default=None)
     max_tokens: Optional[int] = Field(default=None)
+    max_completion_tokens: Optional[int] = Field(default=None)
     n: Optional[int] = Field(default=None)
     presence_penalty: Optional[float] = Field(default=None)
     response_format: Optional[ResponseFormat] = Field(default=None)
@@ -51,6 +56,8 @@ class OpenAIRequest(BaseModel):
     tools: Optional[List[ChatCompletionToolParam]] = Field(default=None)
     top_p: Optional[float] = Field(default=None)
     user: Optional[str] = Field(default=None)
+    reasoning: Optional[ReasoningConfig] = Field(default=None)
+    verbosity: Optional[Literal["low","medium","high"]] = Field(default=None)
 
     class Config:
         extra = 'forbid'
