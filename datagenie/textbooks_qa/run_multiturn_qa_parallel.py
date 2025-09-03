@@ -74,6 +74,9 @@ import json as _json
 
 _BANNED_PHRASES: List[str] = []
 
+import re
+THINK_PATTERN = re.compile(r"<think>.+?</think>", re.DOTALL | re.IGNORECASE)
+
 def _load_banned_phrases() -> List[str]:
     global _BANNED_PHRASES
     if _BANNED_PHRASES:
@@ -143,11 +146,37 @@ def _append_jsonl_line(path_str: str, record: Dict[str, Any]) -> None:
 
 def _autogen_output_paths(results_jsonl: Optional[str], sharegpt_jsonl: Optional[str]) -> tuple[str, str]:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = Path("outputs/multiturn")
+    base_dir = Path("outputs/multiturn_reasoning")
     base_dir.mkdir(parents=True, exist_ok=True)
     res = results_jsonl or str(base_dir / f"multiturn_results_{ts}.jsonl")
     sgd = sharegpt_jsonl or str(base_dir / f"multiturn_sharegpt_{ts}.jsonl")
     return res, sgd
+
+
+# --- Published set helpers ---
+
+def _norm_text(s: Optional[str]) -> str:
+    if not isinstance(s, str):
+        return ""
+    return " ".join(s.split()).strip()
+
+# Key strategy: we consider a sample already published if the (id, rephrased_text) pair exists.
+# This survives minor reorderings and guards against accidental collisions.
+# If 'rephrased_text' is missing in the published dataset, we fall back to id-only matching.
+
+def _load_published_keys(repo_id: str, split: str) -> set[str]:
+    try:
+        dset = load_dataset(repo_id, split=split)
+    except Exception as e:
+        _dbg(f"[skip] could not load published repo {repo_id}:{split}: {e}")
+        return set()
+    keys: set[str] = set()
+    for row in dset:
+        rre = _norm_text(row.get("rephrased_text") or row.get("context_text") or "")
+        if rre:
+            keys.add(rre)
+    _dbg(f"[skip] loaded {len(keys)} published rephrased_text keys from {repo_id}:{split}")
+    return keys
 
 
 #
@@ -290,9 +319,11 @@ async def seed_question_agent(chunk: Dict[str, Any], rephrased_text: str) -> str
         "- Write a single concise question in the same language as the context.\n"
         "- Use the provided context as textbook material for question generation.\n"
         "- The question must be fully self-contained and answerable **without** additional context.\n"
-        "- If the context is fiction (stories, poems, etc.), focus on **themes, ideas, or structures** rather than exact character or plot details.\n"
+        "- If the context is fiction (stories, poems, etc.), ask questions about **themes, ideas, or structures** rather than exact character or plot details.\n"
         "- For problem sets (maths, physics, chemistry, etc.), recreate a **complete solvable question** with necessary numbers, equations, or assumptions.\n"
         "- Do **not** generate questions that depend on diagrams or illustrations.\n"
+        "- Provide complete details such as equations, markdown tables, quotes etc. required for answering questions.\n"
+        "- For technical terms you may put English phrases or full forms in brackets"
         "- Do not use question numbers such as Q0 (a), Q0 (b) etc. and do not include the answer.\n"
         f"- {banned_txt}\n" if banned_txt else ""
         "- Directly output only the question text.\n"
@@ -302,8 +333,8 @@ async def seed_question_agent(chunk: Dict[str, Any], rephrased_text: str) -> str
         persona=persona,
         task=task_prompt,
         llm_config=LLMConfig(
-            client=LLMClient.openai,
-            model=os.environ.get("DATAGEN_MODEL", "gpt-4o-mini"),
+            client=LLMClient.litellm,
+            model=os.environ.get("DATAGEN_MODEL", "openai/gpt-oss-120b"),
             temperature=0.2,
             response_format=ResponseFormat.text,
             #reasoning_effort="minimal",
@@ -363,6 +394,35 @@ def _extract_text(out: ProcessedOutput) -> str:
                 v = getattr(ro, k, None)
                 if isinstance(v, str) and v.strip():
                     return v.strip()
+    except Exception:
+        pass
+    return ""
+
+# Extract 'reasoning_content' if present on the processed output or its raw payload
+def _extract_reasoning(out: ProcessedOutput) -> str:
+    # direct attribute on ProcessedOutput
+    try:
+        rc = getattr(out, "reasoning_content", None)
+        if isinstance(rc, str) and rc.strip():
+            return rc.strip()
+    except Exception:
+        pass
+    # nested raw_output (OpenAI-compatible) - look into message or choice
+    try:
+        ro = getattr(out, "raw_output", None)
+        if ro is not None:
+            # Some wrappers expose a dict at ro.raw_result
+            raw = getattr(ro, "raw_result", None)
+            if isinstance(raw, dict):
+                # vLLM/OpenAI style: choices[0].message.reasoning_content
+                try:
+                    ch = (raw.get("choices") or [])[0]
+                    msg = ch.get("message") or {}
+                    rc = msg.get("reasoning_content")
+                    if isinstance(rc, str) and rc.strip():
+                        return rc.strip()
+                except Exception:
+                    pass
     except Exception:
         pass
     return ""
@@ -442,19 +502,22 @@ async def followup_question_agent(prev_questions: List[str], prev_answers: List[
         objectives=["Produce the next sub-question only."],
         skills=["Scaffolding difficulty", "Curriculum mapping"],
     )
+    # Build history without any numbering like Q0, A1, (a), etc.
+    # We just show neutral Q/A labels so the model doesn't pick up numbering.
     history_text = "\n".join(
-        [f"Q{i}: {q}\nA{i}: {a}" for i, (q, a) in enumerate(zip(prev_questions, prev_answers))]
+        [f"Q: {q}\nA: {a}" for (q, a) in zip(prev_questions, prev_answers)]
     )
     banned_txt = _banned_block()
     task = (
         f"Previous parts and answers:\n{history_text}\n\n"
-        f"Write the next sub-question (part {label}). Difficulty: {target_level}.\n"
+        f"Write the next sub-question. Difficulty: {target_level}.\n"
         f"\n#Guidelines:\n"
         f"- Use the same language as previous parts. Output only the question text."
         "- The question must be fully self-contained and answerable **without** additional context.\n"
         "- Do **not** ask about minor details like character names, authors.\n"
         "- If the context is fiction (stories, poems, etc.), focus on **themes, ideas, or structures** rather than exact character or plot details.\n"
         "- For problem sets (maths, physics, chemistry, etc.), recreate a **complete solvable question** with necessary numbers, equations, or assumptions.\n"
+        "- For technical terms you may put English phrases or full forms in brackets"
         "- Do **not** generate questions that depend on diagrams or illustrations.\n"
         "- Do not include the answer.\n"
         f"- {banned_txt}\n" if banned_txt else ""
@@ -465,8 +528,8 @@ async def followup_question_agent(prev_questions: List[str], prev_answers: List[
         persona=persona,
         task=task,
         llm_config=LLMConfig(
-            client=LLMClient.openai,
-            model=os.environ.get("DATAGEN_MODEL", "gpt-4o-mini"),
+            client=LLMClient.litellm,
+            model=os.environ.get("DATAGEN_MODEL", "openai/gpt-oss-120b"),
             temperature=0.4,
             response_format=ResponseFormat.text,
             #reasoning_effort="minimal",
@@ -536,6 +599,11 @@ async def answers_parallel_via_threads(
     for th, q in zip(simple_threads, next_questions):
         tid = _thread_id(th.chat_thread)
         th.chat_thread.new_message = q
+        # Prefill reasoning tag to nudge the model to emit <think> first (matches alpaca parallel runner)
+        #try:
+        #    setattr(th.chat_thread, "prefill", "<think>\n")
+        #except Exception:
+        #    pass
         chat_threads.append(th.chat_thread)
         pending[tid] = q
         _dbg(f"[ask] stage next user tid={tid} q_len={len(q or '')}")
@@ -562,14 +630,25 @@ async def answers_parallel_via_threads(
             _dbg(f"[ask] MISSING output for tid={tid}")
             outs.append(Exception("answer missing for thread"))
             continue
+
+        # Extract assistant visible text and optional reasoning
         ans = _extract_text(r)
+        rc = _extract_reasoning(r)
+
+        # If the model already included a <think>...</think> block in the visible answer, don't add another.
+        has_think_already = bool(THINK_PATTERN.search(ans))
+
+        if rc and not has_think_already:
+            # Wrap provider-supplied reasoning inside <think> tags, then append the visible answer
+            ans = f"<think>\n{rc}\n</think>\n\n{ans}"
+
         try:
             # Do NOT add_user_message here; orchestrator already added the user based on new_message
             if hasattr(th.chat_thread, "add_chat_turn_history"):
                 maybe_coro = th.chat_thread.add_chat_turn_history(r)
                 if asyncio.iscoroutine(maybe_coro):
                     await maybe_coro
-            _dbg(f"[ask] committed assistant tid={tid} a_len={len(ans)}")
+            _dbg(f"[ask] committed assistant tid={tid} a_len={len(ans)} rc_len={len(rc)}")
         except Exception as e:
             _dbg(f"[ask] commit failed tid={tid}: {e}")
         outs.append(ans)
@@ -760,15 +839,17 @@ def new_chatthread_fn(system_hidden_context: str) -> SimpleChatThread:
     if banned_txt:
         combined = (
             f"{system_hidden_context}\n\n"
-            "#Constraints:\n"
-            "- Answer in the same language as the question.\n"
-            "- For questions with exact answer in math and science, please reason step by step, and put your final answer within \boxed{}."
-            "- Do not reference that a textbook or rephrased context exists; just answer.\n"
             f"- {banned_txt}"
+            "#Constraints:\n"
+            "- \nFor questions with exact answer in math and science, please reason step by step, and put your final answer within a box: \\boxed{}."
+            "- \nDo not reference that a textbook or rephrased context exists; just answer."
+            "- \nYour reasoning language can be English with interleaved same language"
+            "- \nYour reasoning must be relevant tot he topic of the QA"
+            "- \nYour step-by-step reasoning must be strictly about the question alone not these instructions"
         )
     else:
         combined = system_hidden_context
-    return SimpleChatThread(system_hidden_context=combined, llm_model=os.environ.get("DATAGEN_MODEL", "gpt-4.1-mini"))
+    return SimpleChatThread(system_hidden_context=combined, llm_model=os.environ.get("DATAGEN_MODEL", "openai/gpt-oss-120b"))
 
 
 
@@ -816,11 +897,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf_path", default=None)
     parser.add_argument("--split", default="train")
     parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=50, help="Number of rows to process from start")
+    parser.add_argument("--limit", type=int, default=None, help="Max rows to process after filtering; omit for no cap")
     parser.add_argument("--num_turns", type=int, default=3, help="Number of GENERATED user turns (seed Q/A is few-shot and NOT counted)")
     parser.add_argument("--batch_size", type=int, default=8, help="Parallel slab size for orchestrator.run_parallel_ai_completion")
     parser.add_argument("--results_jsonl", default=None, help="Path to results JSONL. If omitted, auto-generates under outputs/multiturn.")
     parser.add_argument("--sharegpt_jsonl", default=None, help="Path to ShareGPT JSONL. If omitted, auto-generates under outputs/multiturn.")
+    parser.add_argument("--skip_published", action="store_true", help="Skip rows that already exist in the published multiturn HF repo")
+    parser.add_argument("--published_repo_id", default="your_username/your_dataset", help="HF dataset repo id that already contains published multiturn records")
+    parser.add_argument("--published_split", default="train", help="Split to read from the published multiturn repo")
     return parser.parse_args()
 
 
@@ -837,18 +921,49 @@ def main() -> None:
     print(f"[runner] Loading HF dataset: {ARGS.hf_path} split={ARGS.split}")
     ds = load_dataset(ARGS.hf_path, split=ARGS.split)
 
-    end = min(len(ds), ARGS.start + ARGS.limit)
-    print(f"[runner] Processing rows {ARGS.start}:{end} (num_turns={ARGS.num_turns})")
+    total_len = len(ds)
+    if ARGS.skip_published:
+        # Scan from start to the end so we can fill the post-filter limit properly
+        end = total_len
+        print(f"[runner] Skip-published enabled: scanning rows {ARGS.start}:{end} (will apply --limit AFTER filtering)")
+    else:
+        if ARGS.limit is None:
+            end = total_len
+        else:
+            end = min(total_len, ARGS.start + ARGS.limit)
+        print(f"[runner] Processing rows {ARGS.start}:{end} (num_turns={ARGS.num_turns})")
+
+    if ARGS.skip_published:
+        print(f"[runner] Will skip rows that appear in {ARGS.published_repo_id}:{ARGS.published_split}")
 
     pipeline = build_pipeline(ARGS.num_turns)
 
     processed = 0
     slab_size = int(ARGS.batch_size)
-    idx = ARGS.start
-    # Process the dataset in slabs of --batch_size. Each slab fully runs through
-    # seed, follow-ups, and answers in parallel, then appends outputs to JSONLs.
-    while idx < end:
-        slab_rows = [ds[j] for j in range(idx, min(end, idx + slab_size))]
+
+    # Build candidate rows according to start/limit
+    candidates = [ds[j] for j in range(ARGS.start, end)]
+
+    # Optionally filter out rows that already exist in the published multiturn repo
+    if ARGS.skip_published:
+        published = _load_published_keys(ARGS.published_repo_id, ARGS.published_split)
+        before = len(candidates)
+        def _row_key_rephrased(r: Dict[str, Any]) -> str:
+            return _norm_text(r.get("rephrased_text") or r.get("context_text") or "")
+        candidates = [r for r in candidates if _row_key_rephrased(r) and _row_key_rephrased(r) not in published]
+        after = len(candidates)
+        print(f"[runner] Skip-published enabled (rephrased_text match). Filtered {before - after} rows; remaining={after}")
+
+    # If user provided --limit, respect it AFTER filtering so we fill the requested work quota
+    if ARGS.limit is not None and len(candidates) > ARGS.limit:
+        _dbg(f"[runner] Applying post-filter limit: taking first {ARGS.limit} of {len(candidates)} candidates")
+        candidates = candidates[:ARGS.limit]
+
+    # Process the remaining candidates in slabs
+    idx = 0
+    total = len(candidates)
+    while idx < total:
+        slab_rows = candidates[idx: min(total, idx + slab_size)]
         try:
             recs = asyncio.run(process_slab_multiturn(
                 rows=slab_rows,
@@ -862,7 +977,7 @@ def main() -> None:
             processed += len(recs)
             print(f"[runner] Processed {processed} items...")
         except Exception as e:
-            print(f"[runner] Slab {idx}:{min(end, idx+slab_size)} failed: {e}")
+            print(f"[runner] Slab {idx}:{min(total, idx+slab_size)} failed: {e}")
         idx += slab_size
 
     print(f"[runner] Done. Processed={processed}.")
