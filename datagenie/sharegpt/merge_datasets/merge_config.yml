@@ -1,0 +1,46 @@
+# Configuration for merging multiple ShareGPT datasets
+
+# Target repository for the merged dataset
+target_repo: "your-username/your-merged-dataset"
+
+# System message to add to conversations without one
+system_message: "You are a helpful AI assistant"
+
+# Datasets to merge from HuggingFace Hub
+hub_datasets:
+#  - name: "your-username/textbooks-qa-dataset"
+#    split: "train"
+#    description: "Textbooks Q&A dataset"
+#
+#  - name: "your-username/alpaca-format-dataset"
+#    split: "train"
+#    description: "Alpaca format dataset"
+#
+#  - name: "your-username/health-qa-dataset"
+#    split: "train"
+#    description: "Health Q&A dataset"
+#
+#  - name: "your-username/textbook-qa-multiturn"
+#    split: "train"
+#    description: "Textbook Q&A multiturn dataset"
+#
+#  - name: "your-username/alpaca-multiturn"
+#    split: "train"
+#    description: "Alpaca multiturn dataset"
+#
+  - name: "your-username/textbook-qa-reasoning"
+    split: "train"
+    system_message: "You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."
+# Local files to merge (optional)
+local_files:
+  - path: "output/dataset1.json"
+    source: "Local Dataset 1"
+  
+  - path: "output/dataset2.json"
+    source: "Local Dataset 2"
+
+# Processing options
+options:
+  upload: true                    # Upload to HuggingFace Hub after merging
+  save_local: true               # Save merged dataset to local file
+  output_file: "merged_dataset.json"
