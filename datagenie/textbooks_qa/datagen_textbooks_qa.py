@@ -414,7 +414,7 @@ class TextbookQAGenerator:
     def _to_sharegpt_item(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """Convert a per-chunk result to one ShareGPT item, mirroring save_sharegpt_dataset formatting."""
         qa = result.get('qa_conversation') or {}
-        question = qa.get('question') or '"प्रश्न प्रस्तावत हुन्छ?"'
+        question = qa.get('question') or ''
         answer = qa.get('answer') or ''
         rephrased_text = qa.get('rephrased_text') or ''
         # Populate nulls when judge didn't run
@@ -1099,7 +1099,7 @@ class TextbookQAGenerator:
         for result in results:
             if 'qa_conversation' in result and isinstance(result['qa_conversation'], dict):
                 qa = result['qa_conversation']
-                question = qa.get('question') or '"प्रश्न प्रस्तावत हुन्छ?"'
+                question = qa.get('question') or ''
                 answer = qa.get('answer') or ''
                 rephrased_text = qa.get('rephrased_text') or ''
                 # Populate nulls when judge didn't run so JSON shows `null`
