@@ -47,7 +47,7 @@ class SimpleChatThread:
     - We embed `rephrased_text` directly into the system prompt (string).
     - We DO NOT concatenate history into the user prompt; ChatThread manages history.
     """
-    def __init__(self, system_hidden_context: str, llm_model: str = "gpt-4.1"):
+    def __init__(self, system_hidden_context: str, llm_model: str = "openai/gpt-oss-120b"):
         self.system_hidden_context = system_hidden_context
         self.llm_model = llm_model
 
@@ -55,21 +55,21 @@ class SimpleChatThread:
         sys_content = (
             "You are a curriculum development and educational content creation expert. "
             "You answer structured exam questions with complete solutions.\n"
-            "Answer directly and completely in same language only.\n"
+            "Answer correctly in same language.\n"
             f"Context (hidden):\n{self.system_hidden_context}"
             f"\n\n#Guidelines:"
             f"\n- Use gramatically correct language and provide factually correct information."
             f"\n- Do NOT reference the existence of a textbook context or source material — write naturally as if answering an exam."
             f"\n- For theoretical concepts, provide **descriptive and insightful explanations**."
             f"\n- For problem sets, provide a **full worked-out solution**, showing steps and reasoning clearly."
+            f"\n- For technical terms you may put English phrases or full forms in brackets"
             f"\n- Do NOT include texbook details such as chapter number, title, author, subject, or grade."
-            f"\n- Answer the question directly."
         )
         system_prompt = SystemPrompt(name="qa-thread", content=sys_content)
 
         # LLM configuration for plain text answers
         self.llm_config = LLMConfig(
-            client=LLMClient.openai,
+            client=LLMClient.litellm,
             model=self.llm_model,
             temperature=0.4,
             response_format=ResponseFormat.text,
@@ -140,11 +140,11 @@ class MultiTurnQAPipeline:
     def __init__(
         self,
         cfg: PipelineConfig,
-        # Model/inference callables
-        rephraser_fn: Callable[[Dict[str, Any]], Any],
-        seed_question_fn: Callable[[Dict[str, Any], str], Any],
+        # Model/inference callables (optional where noted)
+        rephraser_fn: Optional[Callable[[Dict[str, Any]], Any]],
+        seed_question_fn: Optional[Callable[[Dict[str, Any], str], Any]],
         followup_question_fn: Callable[[List[str], List[str], str, str], Any],
-        new_chatthread_fn: Callable[[str], Any],
+        new_chatthread_fn: Callable[[], Any],
         # Persistence callables
         append_results_jsonl_fn: Callable[[Dict[str, Any]], None],
         append_sharegpt_jsonl_fn: Callable[[Dict[str, Any]], None],
@@ -167,45 +167,53 @@ class MultiTurnQAPipeline:
         """
         t0 = time.time()
 
-        # 1) Get rephrased text (hidden context)
-        rephrased_text = await _maybe_await(self.rephraser_fn(chunk))
+        # 1) Optional rephrased text (kept only for metadata)
+        rephrased_text = ""
+        if self.rephraser_fn is not None:
+            try:
+                rephrased_text = await _maybe_await(self.rephraser_fn(chunk)) or ""
+            except Exception:
+                rephrased_text = ""
 
-        # 2) Either reuse existing Q(a)/A(a) or generate from scratch
+        # 2) Use existing seed Q/A if present; otherwise bootstrap a seed
         seed_conv = chunk.get("seed_conversation") or chunk.get("conversations")
         questions: List[str] = []
         answers: List[str] = []
         generated_pairs = 0  # counts only pairs generated in this run
 
-        # Build single persistent chat thread seeded with hidden context
-        runner = ConversationRunner(self.new_chatthread_fn(rephrased_text))
+        # Build single persistent chat thread (no hidden context now)
+        runner = ConversationRunner(self.new_chatthread_fn())
 
-        if isinstance(seed_conv, list) and len(seed_conv) >= 2:
+        has_seed = isinstance(seed_conv, list) and len(seed_conv) >= 2
+        if has_seed:
             # Trust provided single-turn seed from HF 'conversations': [human, gpt]
             Qa = seed_conv[0]["value"]
             Aa = seed_conv[1]["value"]
             questions.append(Qa)
             answers.append(Aa)
-            # Prime the thread with the seed pair so part (b) sees part (a)
+            # Prime the thread with the seed pair so follow-ups see it
             if hasattr(runner.thread, "append_user") and hasattr(runner.thread, "append_assistant"):
                 runner.thread.append_user(Qa)
                 runner.thread.append_assistant(Aa)
         else:
-            # Generate Q(a) then A(a)
-            Qa = await _maybe_await(self.seed_question_fn(chunk, rephrased_text))
+            # Bootstrap a seed question
+            if self.seed_question_fn is not None:
+                Qa = await _maybe_await(self.seed_question_fn(chunk, rephrased_text))
+            else:
+                # Fall back to using the follow-up generator to create the first question (label 'a')
+                Qa = await _maybe_await(self.followup_question_fn([], [], 'a', _target_level(self.cfg.difficulty_profile, 0)))
             Aa = await runner.ask(Qa)
             questions.append(Qa)
             answers.append(Aa)
-            generated_pairs += 1  # seed generated in this run counts toward num_turns
+            generated_pairs += 1  # first generated pair in this run
 
         # 3) Follow-ups within the same thread (multiturn only)
         if self.cfg.mode == "multiturn":
-            # We must generate exactly `num_turns` user turns in this run.
-            # If the dataset provided a seed Q/A, generated_pairs starts at 0.
-            # If we generated the seed, generated_pairs == 1 already.
+            # Generate exactly num_turns user turns in this run (excluding dataset seed).
             while generated_pairs < max(0, int(self.cfg.num_turns)):
-                # Compute labels based on how many questions exist:
-                # len(questions) == 0 -> 'a', 1 -> 'b', etc.
-                label = _label_for(len(questions))
+                # Label logic: if a dataset seed exists, first generated turn is 'b'; else it's 'a'.
+                base_ord = ord('b') if has_seed else ord('a')
+                label = chr(base_ord + generated_pairs)
                 target_level = _target_level(self.cfg.difficulty_profile, len(questions))
                 Qi = await _maybe_await(
                     self.followup_question_fn(questions, answers, label, target_level)
