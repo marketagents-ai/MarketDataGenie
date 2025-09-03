@@ -44,6 +44,8 @@ from market_agents.task_manager import (
     TextbookChunk
 )
 
+from utils import _is_valid_example
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -66,8 +68,10 @@ def _pick_dynamic_example(batch_results: List[Dict[str, Any]]) -> Optional[Dict[
             a = (qa.get("answer") or "").strip()
             rp = (qa.get("rephrased_text") or "").strip()
             score = qa.get("quality_score")
-            score_val = float(score) if score is not None else 0.0
-            candidates.append((score_val, {"question": q, "answer": a}))
+
+            if _is_valid_example(q, a, rp):
+                score_val = float(score) if score is not None else 0.0
+                candidates.append((score_val, {"question": q, "answer": a}))            
         except Exception:
             continue
     if not candidates:
@@ -114,6 +118,11 @@ class TextbookQAGenerator:
         self.generated_dataset_name: Optional[str] = None
         self.generated_dataset_split: str = "train"
 
+        # Output control (defaults)
+        self.output_append: bool = False
+        self.output_results_jsonl_name: Optional[str] = None
+        self.output_sharegpt_jsonl_name: Optional[str] = None
+
         if config_path:
             if yaml is None:
                 raise ImportError("PyYAML is required to use config files. Install with: pip install pyyaml")
@@ -127,6 +136,19 @@ class TextbookQAGenerator:
             ds_cfg = (cfg.get('dataset') or {})
             schema_cfg = (cfg.get('schema') or {})
             gen_cfg = (cfg.get('generation') or {})
+
+            # Output settings (optional append-to-same-file behavior)
+            out_cfg = (cfg.get('output') or {})
+            self.output_append = bool(out_cfg.get('append', self.output_append))
+            self.output_results_jsonl_name = out_cfg.get('results_jsonl', self.output_results_jsonl_name)
+            self.output_sharegpt_jsonl_name = out_cfg.get('sharegpt_jsonl', self.output_sharegpt_jsonl_name)
+
+            # If append mode is enabled and filenames are provided, pre-set the jsonl paths now
+            if self.output_append:
+                if self.output_results_jsonl_name:
+                    self.results_jsonl_path = self.output_dir / self.output_results_jsonl_name
+                if self.output_sharegpt_jsonl_name:
+                    self.sharegpt_jsonl_path = self.output_dir / self.output_sharegpt_jsonl_name
 
             # Dataset settings
             self.dataset_name = ds_cfg.get('name', self.dataset_name)
@@ -174,6 +196,14 @@ class TextbookQAGenerator:
             self.retry_until_complete = False
         if not hasattr(self, 'completed_state_file'):
             self.completed_state_file = str(Path(self.output_dir) / "completed_state.json")
+
+        # Ensure output flags exist if config not provided
+        if not hasattr(self, 'output_append'):
+            self.output_append = False
+        if not hasattr(self, 'output_results_jsonl_name'):
+            self.output_results_jsonl_name = None
+        if not hasattr(self, 'output_sharegpt_jsonl_name'):
+            self.output_sharegpt_jsonl_name = None
 
         # Ensure safe defaults for tokenization/truncation controls
         if not hasattr(self, "model_encoding"):
