@@ -663,6 +663,16 @@ def main():
 
     data_files = { split_name: str(final_path) }
     dset = load_dataset("json", data_files=data_files)
+    # Keep only required columns to avoid leaking extra metadata on Hub
+    keep_cols = {"id", "conversations"}
+    try:
+        pruned = {}
+        for split_name, ds in dset.items():
+            remove = [c for c in ds.column_names if c not in keep_cols]
+            pruned[split_name] = ds.remove_columns(remove) if remove else ds
+        dset = DatasetDict(pruned)  # type: ignore
+    except Exception as e:
+        print(f"[uploader] Warning: failed to prune columns; proceeding as-is: {e}")
 
     # Push to hub
     # Note: push_to_hub accepts `token` and will create/overwrite splits.
