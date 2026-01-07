@@ -397,49 +397,50 @@ def api_endpoint_from_url(request_url: str) -> Literal["completions", "embedding
     """
     Extracts the API endpoint from a given request URL.
 
-
-    This function applies a regular expression search to find the API endpoint pattern within the provided URL.
-    It supports extracting endpoints from standard OpenAI API URLs, custom Azure OpenAI deployment URLs,
-    and vLLM endpoints.
-
-    Parameters:
-    - request_url (str): The full URL of the API request.
-
-    Returns:
-    - str: The extracted endpoint from the URL. If the URL does not match expected patterns,
-      this function may raise an IndexError for accessing a non-existing match group.
-
-    Example:
-    - Input: "https://api.openai.com/v1/completions"
-      Output: "completions"
-    - Input: "https://custom.azurewebsites.net/openai/deployments/my-model/completions"
-      Output: "completions"
-    - Input: "http://localhost:8000/v1/completions"
-      Output: "completions"
+    Supports:
+    - Standard OpenAI API URLs, e.g. https://api.openai.com/v1/chat/completions
+    - Azure OpenAI deployment URLs, e.g. https://{host}/openai/deployments/{dep}/chat/completions
+    - Local/vLLM style endpoints, e.g. http://localhost:8000/v1/chat/completions
+    - Generic inference hosts that only specify the API version without an endpoint, e.g.
+      https://inference-api.nousresearch.com/v1
+      In this base-URL case, default to "chat" since the vast majority of calls target the Chat Completions API.
     """
-    match = re.search("^https://[^/]+/v\\d+/(.+)$", request_url)
-    if match is None:
-        # for Azure OpenAI deployment urls
-        match = re.search(r"^https://[^/]+/openai/deployments/[^/]+/(.+?)(\?|$)", request_url)
-        if match is None:
-            # for vLLM endpoints
-            match = re.search(r"^http://localhost:8000/v\d+/(.+)$", request_url)
-            if match is None:
-                if "v1/chat/completions" in request_url:
-                    match = [None,"chat"]
-                else:
-                    raise ValueError(f"Invalid URL: {request_url}")
-
-                
-    if "messages" in match[1]:
-        return "messages"
-
-    elif "chat" in match[1]:
+    # Fast-path special case for a fully qualified chat path in any scheme/host
+    if "v1/chat/completions" in request_url:
         return "chat"
-    elif "embeddings" in match[1]:
+
+    # Try standard OpenAI-style: https://<host>/v{n}/<endpoint...>
+    # This allows http or https and any host (not only localhost), optional trailing slash,
+    # and captures the first segment after /v{n}/ if present.
+    m = re.search(r"^https?://[^/]+/v\d+/?(?P<seg>[^/?#]+)?", request_url)
+
+    # Azure deployments: https://<host>/openai/deployments/<name>/<endpoint...>
+    if not m:
+        m = re.search(r"^https?://[^/]+/openai/deployments/[^/]+/(?P<seg>[^/?#]+)", request_url)
+
+    # If still not matched, allow common localhost patterns with ports
+    if not m:
+        m = re.search(r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?/v\d+/?(?P<seg>[^/?#]+)?", request_url)
+
+    if not m:
+        raise ValueError(f"Invalid URL: {request_url}")
+
+    seg = m.groupdict().get("seg") if m else None
+
+    # If only the base URL is provided (e.g., .../v1 or .../v1/), default to chat
+    if not seg:
+        return "chat"
+
+    # Normalize and map the first segment after /v{n}/ or after deployments/{name}/
+    seg = seg.lower()
+    if "messages" in seg:
+        return "messages"
+    if "chat" in seg:
+        return "chat"
+    if "embeddings" in seg:
         return "embeddings"
-    else:
-        return "completions"
+    # Fallbacks: treat anything else as completions
+    return "completions"
 
 
 

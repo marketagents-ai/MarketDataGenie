@@ -98,15 +98,32 @@ async def run_parallel_ai_completion(
 ) -> List[ProcessedOutput]:
     """Run parallel AI completion for multiple chat threads."""
     EntityRegistry._logger.info(f"Starting parallel AI completion for {len(chat_threads)} chat threads")
-    # First add user messages to all chat threads
-    for chat in chat_threads:
+    # Add user messages only when appropriate
+    for chat in list(chat_threads):
         try:
-            EntityRegistry._logger.info(f"Adding user message to ChatThread({chat.id})")
-            chat.add_user_message()
+            # If a workflow is already in progress (step set), do not force-add a new user turn
+            if not (chat.llm_config.response_format == ResponseFormat.workflow and chat.workflow_step is not None):
+                EntityRegistry._logger.info(f"Adding user message to ChatThread({chat.id})")
+                chat.add_user_message()
+            else:
+                EntityRegistry._logger.info(
+                    f"Skipping user message for ChatThread({chat.id}) "
+                    f"because workflow is in progress at step {chat.workflow_step}"
+                )
         except Exception as e:
-            if chat.llm_config.response_format != ResponseFormat.auto_tools or chat.llm_config.response_format != ResponseFormat.workflow:
+            msg = str(e).lower()
+            # Benign case: no pending user content to add; keep the thread and proceed
+            if "no new message content" in msg:
+                EntityRegistry._logger.info(
+                    f"Skipping user message for ChatThread({chat.id}): {e}"
+                )
+                continue
+            # Only drop the thread for non-workflow / non-auto-tools formats
+            if chat.llm_config.response_format not in (ResponseFormat.auto_tools, ResponseFormat.workflow):
                 chat_threads.remove(chat)
-                EntityRegistry._logger.error(f"Error adding user message to ChatThread({chat.id}): {e}")
+            EntityRegistry._logger.error(
+                f"Error adding user message to ChatThread({chat.id}): {e}"
+            )
 
     # Run LLM completions in parallel
     tasks = []

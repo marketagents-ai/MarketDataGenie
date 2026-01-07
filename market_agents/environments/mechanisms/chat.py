@@ -68,11 +68,9 @@ class ChatMechanism(Mechanism):
         else:
             final_answer = str(action.action)
         
-        self.chat_history.append(ChatMessage(
-            content=final_answer,
-            timestamp=timestamp,
-            role="assistant"
-        ))
+        assistant_msg = ChatMessage(content=final_answer, timestamp=timestamp, role="assistant")
+        self.chat_history.append(assistant_msg)
+        logger.info(f"[Chat.step] assistant -> {assistant_msg.content[:200]}{'…' if len(assistant_msg.content) > 200 else ''}")
         
         last_user_message = next(
             (msg for msg in reversed(self.chat_history) 
@@ -89,12 +87,18 @@ class ChatMechanism(Mechanism):
         return LocalEnvironmentStep(
             observation=observation,
             done=False,
-            info={"chat_history": self.chat_history}
+            info={
+                "assistant_text": assistant_msg.content,
+                "assistant_message": assistant_msg.model_dump(),
+                "last_user_message": last_user_message.model_dump(),
+                "chat_history": [m.model_dump() if hasattr(m, "model_dump") else m.__dict__ for m in self.chat_history]
+            }
         )
 
     def get_global_state(self, agent_id: Optional[str] = None) -> List[ChatMessage]:
         """Get the global state of the chat, optionally filtered for an agent."""
-        return self.chat_history
+        logger.info(f"[Chat.get_global_state] history_len={len(self.chat_history)}")
+        return [m.model_dump() if hasattr(m, "model_dump") else m.__dict__ for m in self.chat_history]
 
     def add_user_message(self, content: str):
         """Add a user message to the chat history"""
@@ -104,6 +108,7 @@ class ChatMechanism(Mechanism):
             timestamp=timestamp,
             role="user"
         ))
+        logger.info(f"[Chat.add_user_message] user -> {content[:200]}{'…' if len(content) > 200 else ''}")
 
 class ToolEnabledChatActionSpace(ActionSpace):
     """ActionSpace that supports both chat actions and tools"""
@@ -116,76 +121,79 @@ class ToolEnabledChatActionSpace(ActionSpace):
         default=False,
         description="Whether tools should be executed in sequence"
     )
-    
-    def __init__(self, tools=None, **data):
+    interactive: bool = Field(
+        default=False,
+        description="Whether to include speak_to_user tool for interactive chat"
+    )
+
+    def __init__(self, tools=None, interactive: bool = False, **data):
         # Initialize with empty lists
         super().__init__()
-        
+
         # Set workflow flag explicitly
         self.workflow = False
-        
+        self.interactive = interactive
+
         # Process tools
         if tools and len(tools) > 0:
-            # Create speak_to_user tool
-            speak_to_user_tool = StructuredTool(
-                json_schema=ChainOfThoughtSchema.model_json_schema(),
-                name="speak_to_user",
-                description="Respond directly to the user with reasoning and final answer"
-            )
-            
-            # Add speak_to_user to tools list - put it FIRST for priority
-            all_tools = [speak_to_user_tool] + list(tools)
-            
-            # Set both tools and allowed_actions to ensure they're found by ActionStep
+            if interactive:
+                speak_to_user_tool = StructuredTool(
+                    json_schema=ChainOfThoughtSchema.model_json_schema(),
+                    name="speak_to_user",
+                    description="Respond directly to the user with reasoning and final answer"
+                )
+                all_tools = [speak_to_user_tool] + list(tools)
+            else:
+                all_tools = list(tools)
             self.tools = all_tools
             self.allowed_actions = all_tools
-            
-            logger.info(f"Created action space with {len(all_tools)} tools (including speak_to_user)")
+            logger.info(
+                f"Created action space with {len(all_tools)} tools"
+                f"{' (including speak_to_user)' if interactive else ''}"
+            )
             for tool in all_tools:
                 if hasattr(tool, 'name'):
                     logger.info(f"  - Tool: {tool.name}")
         else:
-            # When no tools are provided, use the standard ChatAction
-            self.allowed_actions = [ChatAction]
+            # When no tools are provided, use the standard StrAction
+            self.allowed_actions = [StrAction]
             self.tools = []
-            logger.info("Created action space with only ChatAction")
-    
+            logger.info("Created action space with only StrAction (pure text)")
+
     def set_tools(self, tools):
         """Update available tools"""
         if tools and len(tools) > 0:
-            # Create speak_to_user tool
-            speak_to_user_tool = StructuredTool(
-                json_schema=ChainOfThoughtSchema.model_json_schema(),
-                name="speak_to_user",
-                description="Respond directly to the user with reasoning and final answer"
-            )
-            
-            # Create combined tools list with speak_to_user first
-            all_tools = [speak_to_user_tool] + list(tools)
-            
-            # Update both tools and allowed_actions
+            if self.interactive:
+                speak_to_user_tool = StructuredTool(
+                    json_schema=ChainOfThoughtSchema.model_json_schema(),
+                    name="speak_to_user",
+                    description="Respond directly to the user with reasoning and final answer"
+                )
+                all_tools = [speak_to_user_tool] + list(tools)
+            else:
+                all_tools = list(tools)
             self.tools = all_tools
             self.allowed_actions = all_tools
-            
-            logger.info(f"Updated action space with {len(all_tools)} tools (including speak_to_user)")
+            logger.info(
+                f"Updated action space with {len(all_tools)} tools"
+                f"{' (including speak_to_user)' if self.interactive else ''}"
+            )
             for tool in all_tools:
                 if hasattr(tool, 'name'):
                     logger.info(f"  - Tool: {tool.name}")
         else:
-            # When no tools are provided, use the standard ChatAction
-            self.allowed_actions = [ChatAction]
+            # When no tools are provided, use the standard StrAction
+            self.allowed_actions = [StrAction]
             self.tools = []
-            logger.info("Updated action space with only ChatAction")
-    
+            logger.info("Updated action space with only StrAction (pure text)")
+
     def get_action_schema(self) -> Dict[str, Any]:
         """Return JSON schema for all available tools"""
         schemas = {}
-        
         # Add schemas for all tools
         for tool in self.tools:
             if hasattr(tool, 'name') and hasattr(tool, 'json_schema'):
                 schemas[tool.name] = tool.json_schema()
-                
         return schemas
 
 class ChatObservationSpace(ObservationSpace):
@@ -197,14 +205,16 @@ class ChatEnvironment(MultiAgentEnvironment):
     action_space: ActionSpace = Field(default_factory=lambda: ToolEnabledChatActionSpace())
     observation_space: ObservationSpace = Field(default_factory=ChatObservationSpace)
     mechanism: Mechanism = Field(default_factory=ChatMechanism)
+    interactive: bool = Field(default=False)
 
-    def __init__(self, name="tool_enabled_chat", tools=None):
+    def __init__(self, name="tool_enabled_chat", tools=None, interactive: bool = False):
         super().__init__(
             name=name,
-            action_space=ToolEnabledChatActionSpace(tools=tools),
+            action_space=ToolEnabledChatActionSpace(tools=tools, interactive=interactive),
             observation_space=ChatObservationSpace(),
             mechanism=ChatMechanism()
         )
+        self.interactive = interactive
         logger.info(f"Created ToolEnabledChatEnvironment with {len(tools or [])} tools")
 
     def update_tools(self, tools):

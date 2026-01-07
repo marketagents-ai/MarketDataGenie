@@ -1,0 +1,35 @@
+# dataset + split
+dataset:
+  name: your-dataset-namespace/your-textbook-dataset
+  split: train
+
+generated_dataset:
+  name: your-dataset-namespace/your-generated-dataset
+  
+# output directory
+output_dir: outputs/textbook_qa
+
+#output:
+#  append: true
+#  results_jsonl: textbook_qa_results_20250819_134037.jsonl
+#  sharegpt_jsonl: textbook_qa_sharegpt_20250819_134037.jsonl
+
+# generation filters and limits
+generation:
+  num_samples: 5600
+  batch_size: 8       # how many chunks to process in parallel
+  per_task_timeout: 300   # seconds (optional)
+  model_encoding: cl100k_base
+  max_input_tokens: 16000
+  subjects: []
+  grades: []
+  retry_until_complete: true
+  completed_state_file: "outputs/textbook_qa/completed_state.json"
+
+# schema mapping for prompt variables only
+schema:
+  text: text
+  subject: subject
+  grade: grade
+  chapter_title: chapter_title
+  source: source

@@ -1,0 +1,73 @@
+# Configuration for converting HuggingFace datasets to ShareGPT format
+# This file maps dataset repositories to their column configurations
+
+repositories:
+  "your-username/your-dataset":
+    source: "your-username/your-dataset"
+    columns:
+      question: "Context"
+      answer: "Response"
+    category: "QA"
+    description: "QA dataset"
+    target_repo: "your-username/your-dataset"
+  # Example: Alpaca format with instruction + context
+
+  # Example: Different column names
+  # "some/dataset":
+  #   source: "Custom Source Name"
+  #   columns:
+  #     question: "prompt"      # Different question column name
+  #     answer: "response"      # Different answer column name
+  #   category: "Custom Category"
+  #   description: "Description of this dataset"
+  #   target_repo: "username/dataset-name-sharegpt"  # Target repo for upload
+  
+  # Example: Multi-turn conversations
+  # "conversation/dataset":
+  #   source: "Conversation Dataset"
+  #   columns:
+  #     question: "user_message"
+  #     answer: "assistant_message"
+  #   category: "Conversation"
+  #   description: "Multi-turn conversation dataset"
+  #   target_repo: "username/conversation-sharegpt"
+  
+  # Example: Code-related dataset
+  # "code/dataset":
+  #   source: "Code Dataset"
+  #   columns:
+  #     question: "instruction"
+  #     answer: "code"
+  #   category: "Code Generation"
+  #   description: "Code generation dataset"
+  #   target_repo: "username/code-sharegpt"
+
+# Global settings (used as defaults when not specified in repository config)
+defaults:
+  question_column: "Question"
+  answer_column: "Answer"
+  category: "Q&A"
+  split: "train"
+  target_repo_prefix: "interstellarninja"  # Default prefix for target repos
+  
+# Processing options
+options:
+  max_samples_per_dataset: null  # Set to limit samples per dataset
+  output_format: "sharegpt"      # Output format (sharegpt, alpaca, etc.)
+  include_metadata: true         # Include source, category, etc. in output
+  auto_upload: false            # Automatically upload after conversion
+  
+  # Validation settings
+  validation:
+    enabled: true               # Enable validation
+    min_length: 10              # Minimum character length for messages
+    min_words: 3                # Minimum word count for messages
+    check_repetition: true      # Check for excessive consecutive repetition
+    max_consecutive_repetition: 3  # Maximum consecutive repetitions of same word
+    check_patterns: true        # Check for placeholder patterns
+    
+  # Deduplication settings
+  deduplication:
+    enabled: true               # Enable deduplication
+    method: "conversation"      # "question" or "conversation" (whole conversation)
+    hash_algorithm: "md5"       # Hash algorithm for deduplication

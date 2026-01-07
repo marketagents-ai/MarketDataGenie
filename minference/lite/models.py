@@ -877,6 +877,14 @@ class LLMConfig(Entity):
         default=True,
         description="Whether to use response caching"
     )
+    reasoning_effort: Optional[Literal["minimal","low","medium","high"]] = Field(
+        default="low",
+        description="Controls how many reasoning tokens GPT-5 spends before emitting visible text."
+    )
+    verbosity: Optional[Literal["low","medium","high"]] = Field(
+        default=None,
+        description="Controls brevity vs. elaboration for GPT-5 responses."
+    )
 
     @model_validator(mode="after")
     def validate_response_format(self) -> Self:
@@ -1721,6 +1729,5 @@ class ChatThread(Entity):
             if message.role == MessageRole.assistant and message.usage:
                 usages.append(message.usage)
         return usages
-
 
 

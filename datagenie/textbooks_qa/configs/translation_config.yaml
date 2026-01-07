@@ -1,0 +1,17 @@
+dataset:
+  name: "your_dataset/your-multilingual_dataset" # Replace with your actual dataset name
+  split: "train"
+  id_field: "id" # The field in your dataset to use as a unique ID for each record
+
+languages:
+  source_languages: ["french""] # Column names in your dataset for source languages
+  target_language: "english" # The target language for translation
+
+generation:
+  num_samples: null # Set to an integer to limit the number of samples, or null for all
+  batch_size: 4 # Number of parallel translation tasks
+  per_task_timeout: 600 # Timeout for each translation task in seconds
+  retry_until_complete: True # Keep retrying failed tasks until all are complete
+  completed_state_file: "completed_translations.json" # File to track completed translations
+
+output_dir: "outputs/translations_dynamic" # Updated output directory

@@ -4,15 +4,15 @@ Maintains exact behavior while making functions reusable outside the orchestrato
 """
 import json
 import time
-from typing import Dict, Any, Optional, List, Union
-from pydantic import ValidationError, BaseModel, Field
+from typing import Dict, Any, Optional, List, Union, Literal
+from pydantic import ValidationError, BaseModel, Field, model_validator
 from uuid import UUID
 from anthropic.types.message_create_params import ToolChoiceToolChoiceTool, ToolChoiceToolChoiceAuto
 from minference.lite.models import ChatThread, LLMClient, ResponseFormat
 from minference.oai_parallel import OAIApiFromFileConfig
 from minference.enregistry import EntityRegistry
-from pydantic import BaseModel, Field
-from typing import  Optional, Union, Dict, List, Any
+  # (removed duplicate import)
+
 
 from openai.types.chat import (
     ChatCompletionMessageParam,
@@ -42,6 +42,8 @@ from anthropic.types import (
 from anthropic.types.model_param import ModelParam
 
 
+
+
 class OpenAIRequest(BaseModel):
     messages: List[ChatCompletionMessageParam]
     model: str
@@ -50,6 +52,7 @@ class OpenAIRequest(BaseModel):
     functions: Optional[List[FunctionDefinition]] = Field(default=None)
     logit_bias: Optional[Dict[str, int]] = Field(default=None)
     max_tokens: Optional[int] = Field(default=None)
+    max_completion_tokens: Optional[int] = Field(default=None)
     n: Optional[int] = Field(default=None)
     presence_penalty: Optional[float] = Field(default=None)
     response_format: Optional[OpenAIResponseFormat] = Field(default=None)
@@ -61,6 +64,14 @@ class OpenAIRequest(BaseModel):
     tools: Optional[List[ChatCompletionToolParam]] = Field(default=None)
     top_p: Optional[float] = Field(default=None)
     user: Optional[str] = Field(default=None)
+    reasoning_effort: Optional[Literal["minimal","low","medium","high"]] = Field(default=None)
+    verbosity: Optional[Literal["low","medium","high"]] = Field(default=None)
+
+    @model_validator(mode="after")
+    def _validate_token_caps(self):
+        if self.max_tokens is not None and self.max_completion_tokens is not None:
+            raise ValueError("Provide only one of max_tokens or max_completion_tokens, not both.")
+        return self
 
     class Config:
         extra = 'forbid'
@@ -225,9 +236,40 @@ def get_openai_request(chat_thread: ChatThread) -> Optional[Dict[str, Any]]:
     request = {
         "model": chat_thread.llm_config.model,
         "messages": messages,
-        "max_tokens": chat_thread.llm_config.max_tokens,
-        "temperature": chat_thread.llm_config.temperature,
     }
+    # Backward/forward compatibility for token caps
+    max_tok = chat_thread.llm_config.max_tokens
+    model_name = chat_thread.llm_config.model or ""
+    def _needs_max_completion_tokens(name: str) -> bool:
+        # Reasoning & newer models (gpt-5 family, o-series) use max_completion_tokens in Chat Completions
+        prefixes = ("gpt-5", "o1", "o2", "o3", "o4")
+        return any(name.startswith(p) for p in prefixes)
+    def _is_reasoning_model(name: str) -> bool:
+        # GPT-5 family and o-series reasoning models have special parameter rules
+        prefixes = ("gpt-5", "o1", "o2", "o3", "o4")
+        return any(name.startswith(p) for p in prefixes)
+    if max_tok is not None:
+        if _needs_max_completion_tokens(model_name):
+            request["max_completion_tokens"] = max_tok
+        else:
+            request["max_tokens"] = max_tok
+
+    # Temperature handling:
+    # - Newer reasoning models (gpt-5, o*) either ignore or reject non-default temperature.
+    # - For those, omit temperature entirely to avoid API errors.
+    if not _is_reasoning_model(model_name):
+        request["temperature"] = chat_thread.llm_config.temperature
+
+    # Reasoning controls for GPT-5 / o* models (Chat Completions schema)
+    if _is_reasoning_model(model_name):
+        effort = getattr(chat_thread.llm_config, "reasoning_effort", None)
+        if effort is not None:
+            request["reasoning_effort"] = effort
+        verb = getattr(chat_thread.llm_config, "verbosity", None)
+        # Only send verbosity if explicitly set
+        if verb is not None:
+            request["verbosity"] = verb
+
     if chat_thread.oai_response_format:
         request["response_format"] = chat_thread.oai_response_format
     if chat_thread.llm_config.response_format == "tool" and chat_thread.forced_output:
