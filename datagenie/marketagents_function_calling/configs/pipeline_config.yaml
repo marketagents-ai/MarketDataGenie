@@ -1,0 +1,79 @@
+# Function Calling Dataset Generation Pipeline Configuration
+
+# ============================================================
+# Mode Selection
+# ============================================================
+# "curriculum" - Generate tools and queries from curriculum CSV/JSONL (default)
+# "huggingface" - Augment existing HuggingFace dataset to multi-turn
+mode: "curriculum" #"huggingface"
+
+# ============================================================
+# Curriculum Mode Settings
+# ============================================================
+curriculum:
+  file: "configs/curriculum/function_calling.csv"
+  categories: []
+  subcategories: []
+
+# ============================================================
+# HuggingFace Mode Settings
+# ============================================================
+huggingface:
+  dataset_name: "Salesforce/xlam-function-calling-60k"
+  split: "train"
+
+# ============================================================
+# Generation Settings
+# ============================================================
+generation:
+  batch_size: 8
+  # Max tool call recursion depth (3 is usually enough - search, action, confirm)
+  max_recursion_depth: 3
+  per_task_timeout: 300
+  # Save results even if max recursion is hit (partial results)
+  save_partial_results: true
+  # Generate non-tool-calling follow-up that analyzes previous tool results
+  # This creates a user question + assistant response that reasons over existing data
+  generate_analysis_followup: true
+  # Generate reasoning tokens within <think></think> tags before tool calls and responses
+  # Enables chain-of-thought reasoning for the tool calling agent
+  generate_reasoning: true
+  # Validate that <think> blocks are properly formatted when generate_reasoning is enabled
+  validate_reasoning: true
+
+# ============================================================
+# Docstring Generation Settings
+# ============================================================
+docstrings:
+  # Only triggers if tools from seed dataset lack descriptions AND this is true
+  generate: true
+
+# ============================================================
+# Output Settings
+# ============================================================
+output:
+  dir: "outputs/function_calling"
+  sharegpt: true
+  append: false
+  # Pretty print messages and responses with colors for debugging
+  debug_print_messages: true
+
+# ============================================================
+# Validation Settings
+# ============================================================
+validation:
+  validate_tool_calls: true
+  require_matching_arguments: true
+  # Require tool call on first assistant turn (fail if clarification request)
+  # Set to false to allow clarification flows
+  require_tool_call_on_first_turn: false
+  # Allow clarification flow: when assistant asks for details, generate user response with details
+  # This creates more realistic multi-turn conversations
+  allow_clarification_flow: true
+
+# ============================================================
+# Agent LLM Configuration
+# ============================================================
+# Per-agent LLM settings are in agents_config.yaml
+# This allows mixing different models for different agents
+agents_config: "configs/agents_config.yaml"
