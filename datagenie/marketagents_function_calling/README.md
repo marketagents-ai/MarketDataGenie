@@ -1,12 +1,68 @@
 # MarketAgents Function Calling Dataset Generation Pipeline
 
-A modular pipeline for generating multi-turn function calling datasets using the `minference` + `market_agents` SDK.
+A modular pipeline for generating multi-turn function calling datasets with chain-of-thought reasoning using the `minference` + `market_agents` SDK.
+
+## Pipeline Workflow
+
+```mermaid
+flowchart TD
+    subgraph Input["📥 Input"]
+        A1[Curriculum CSV/JSONL] --> B1[Tool Generator Agent]
+        A2[HuggingFace Dataset] --> B2[Load Tools & Query]
+        B1 --> C1[Query Generator Agent]
+    end
+
+    subgraph ToolCalling["🔧 Tool Calling Workflow"]
+        C1 --> D[User Query]
+        B2 --> D
+        D --> E[Tool Calling Agent<br/><i>with &lt;think&gt; reasoning</i>]
+        E -->|"&lt;tool_call&gt;"| F{Has Tool Call?}
+        F -->|Yes| G[Schema Agent]
+        G --> H[Results Agent]
+        H -->|"&lt;tool_response&gt;"| I[Append to History]
+        I --> J[Run Inference<br/><i>Generate Summary</i>]
+        J -->|"&lt;think&gt; + response"| K{More Tool Calls?}
+        K -->|Yes| G
+        K -->|No| L[Summary Complete]
+        F -->|No - Clarification| M[Clarification Agent]
+        M --> E
+    end
+
+    subgraph FollowUp["🔄 Follow-up Generation"]
+        L --> N[Follow-up Agent]
+        N -->|New Query| O[Tool Calling Workflow]
+        O --> P[Multi-turn Complete]
+        P --> Q{Analysis Follow-up?}
+        Q -->|Yes| R[Analysis Follow-up Agent]
+        R -->|"Q&A with &lt;think&gt;"| S[Final Conversation]
+        Q -->|No| S
+    end
+
+    subgraph Validation["✅ Validation & Output"]
+        S --> T{Valid &lt;think&gt; blocks?}
+        T -->|Yes| U[ShareGPT Conversion]
+        T -->|No| V[Truncate to Last Valid Turn]
+        V --> U
+        U --> W[("📄 Output JSONL")]
+    end
+
+    style E fill:#e1f5fe
+    style J fill:#e1f5fe
+    style R fill:#e1f5fe
+    style V fill:#fff3e0
+    style W fill:#e8f5e9
+```
 
 ## Features
 
 - **Two generation modes**:
-  - **Curriculum mode** (default): Generate tools and queries from task descriptions
+  - **Curriculum mode**: Generate tools and queries from task descriptions (CSV/JSONL)
   - **HuggingFace mode**: Augment existing single-turn datasets to multi-turn
+
+- **Chain-of-thought reasoning** (`generate_reasoning=True`):
+  - All assistant responses include `<think></think>` reasoning blocks
+  - Uses `ResponseFormat.text` with XML tool call tags (Hermes format)
+  - Validates `<think>` blocks on every assistant turn
 
 - **Multi-agent architecture**:
   - Tool Generator Agent (curriculum mode)
@@ -15,8 +71,19 @@ A modular pipeline for generating multi-turn function calling datasets using the
   - Schema Generator Agent
   - Results Generator Agent
   - Follow-up Query Agent
+  - Clarification Agent (handles ambiguous queries)
+  - Analysis Follow-up Agent (generates non-tool-calling follow-ups)
 
-- **Conditional docstring generation**: Only generates docstrings when tools are missing descriptions AND `generate_docstrings=True`
+- **Robust validation**:
+  - Validates `<think>` blocks on all assistant turns
+  - Detects malformed `<tool_call>` tags (reasoning inside tool_call)
+  - Detects truncated tool calls (max_tokens issues)
+  - Removes consecutive user messages
+  - Truncates to last valid turn (preserves data)
+
+- **Parallel tool calls**: Supports multiple tool calls in a single turn
+
+- **ShareGPT output format** with XML tags for tool calls/responses
 
 ## Installation
 
@@ -28,7 +95,7 @@ pip install minference market_agents pydantic datasets tqdm tenacity python-dote
 
 ## Usage
 
-### Curriculum Mode (Default)
+### Curriculum Mode
 
 Generate from curriculum CSV/JSONL:
 
@@ -53,111 +120,180 @@ python -m datagenie.marketagents_function_calling.run --mode huggingface --limit
 
 # Custom dataset
 python -m datagenie.marketagents_function_calling.run --mode huggingface --dataset Salesforce/xlam-function-calling-60k --start 0 --limit 100
-
-# Skip docstring generation
-python -m datagenie.marketagents_function_calling.run --mode huggingface --no_docstrings --limit 100
 ```
 
-### CLI Options
+## Configuration
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--mode` | `curriculum` | Generation mode: `curriculum` or `huggingface` |
-| `--curriculum` | `configs/curriculum/function_calling.csv` | Curriculum file path |
-| `--categories` | `[]` | Filter by categories (curriculum mode) |
-| `--subcategories` | `[]` | Filter by subcategories (curriculum mode) |
-| `--dataset` | `Salesforce/xlam-function-calling-60k` | HuggingFace dataset |
-| `--start` | `0` | Starting index (huggingface mode) |
-| `--limit` | `None` | Max tasks to process |
-| `--batch_size` | `8` | Parallel batch size |
-| `--output_dir` | `outputs/function_calling` | Output directory |
-| `--tool_model` | `openai/gpt-4o` | Model for tool calling |
-| `--agent_model` | `anthropic/claude-3-5-sonnet-20241022` | Model for agents |
-| `--no_validate` | `False` | Disable validation (huggingface mode) |
-| `--no_docstrings` | `False` | Disable docstring generation |
+### Pipeline Config (`configs/pipeline_config.yaml`)
+
+```yaml
+# Mode: "curriculum" or "huggingface"
+mode: "huggingface"
+
+# Generation settings
+generation:
+  batch_size: 8
+  max_recursion_depth: 3
+  generate_analysis_followup: true
+  generate_reasoning: true        # Enable <think> blocks
+  validate_reasoning: true        # Validate <think> format
+
+# Validation settings
+validation:
+  validate_tool_calls: true
+  allow_clarification_flow: true
+
+# Output settings
+output:
+  dir: "outputs/function_calling"
+  sharegpt: true
+  debug_print_messages: true
+```
+
+### Agent Config (`configs/agents_config.yaml`)
+
+Per-agent LLM configuration:
+
+```yaml
+tool_calling:
+  model: "Hermes-4-405B"
+  llm_client: "litellm"
+  temperature: 0.6
+  max_tokens: 8192
+
+analysis_followup:
+  model: "gpt-4o"
+  llm_client: "openai"
+  temperature: 0.6
+  max_tokens: 2048
+```
+
+## Output Format
+
+### ShareGPT Format with XML Tags
+
+```json
+{
+  "id": "curriculum_0",
+  "conversations": [
+    {
+      "from": "system",
+      "value": "You are a deep thinking AI... <tools>[...]</tools>..."
+    },
+    {
+      "from": "human", 
+      "value": "Send a WhatsApp message to +1-555-123-4567"
+    },
+    {
+      "from": "gpt",
+      "value": "<think>\nOkay, the user wants to send a message...\n</think>\n\n<tool_call>\n{\"name\": \"send_whatsapp_message\", \"arguments\": {...}}\n</tool_call>"
+    },
+    {
+      "from": "tool",
+      "value": "<tool_response>\n{\"name\": \"send_whatsapp_message\", \"content\": {...}}\n</tool_response>"
+    },
+    {
+      "from": "gpt",
+      "value": "<think>\nThe message was sent successfully...\n</think>\n\nYour message has been sent!"
+    },
+    {
+      "from": "human",
+      "value": "What does the 'sent' status mean?"
+    },
+    {
+      "from": "gpt", 
+      "value": "<think>\nThe user is asking about message statuses...\n</think>\n\nThe 'sent' status means..."
+    }
+  ],
+  "tools": "[...]",
+  "task": "Send messages on Whatsapp",
+  "category": "Use Apps",
+  "subcategory": "Messaging apps",
+  "source": "curriculum"
+}
+```
 
 ## Project Structure
 
 ```
 datagenie/marketagents_function_calling/
-├── __init__.py              # Package exports
-├── config.py                # PipelineConfig, GenerationMode
-├── schemas.py               # Pydantic output schemas
-├── pipeline.py              # Main FunctionCallingPipeline class
-├── run.py                   # CLI entry point
+├── __init__.py
+├── config.py                    # PipelineConfig, AgentLLMConfig
+├── schemas.py                   # Pydantic output schemas
+├── pipeline.py                  # Main FunctionCallingPipeline class
+├── run.py                       # CLI entry point
 ├── agents/
 │   ├── __init__.py
-│   ├── tool_generator.py    # Tool generation (curriculum mode)
-│   ├── query_generator.py   # Query generation (curriculum mode)
-│   ├── docstring_agent.py   # Docstring generation (conditional)
-│   ├── schema_agent.py      # Schema generation
-│   ├── results_agent.py     # Results generation
-│   └── followup_agent.py    # Follow-up query generation
+│   ├── tool_generator.py        # Tool generation (curriculum)
+│   ├── query_generator.py       # Query generation (curriculum)
+│   ├── docstring_agent.py       # Docstring generation
+│   ├── schema_agent.py          # Schema generation
+│   ├── results_agent.py         # Results generation
+│   ├── followup_agent.py        # Follow-up query generation
+│   ├── clarification_agent.py   # Clarification handling
+│   └── analysis_followup_agent.py  # Analysis follow-up Q&A
 ├── utils/
 │   ├── __init__.py
-│   ├── validation.py        # Tool call validation
-│   └── sharegpt.py          # ShareGPT format conversion
+│   ├── validation.py            # Tool call validation
+│   ├── sharegpt.py              # ShareGPT format conversion
+│   ├── reasoning.py             # <think> block validation
+│   └── debug.py                 # Colored debug printing
 └── configs/
     ├── pipeline_config.yaml
+    ├── agents_config.yaml
     └── curriculum/
         └── function_calling.csv
 ```
 
-## Output Format
+## Processing Statistics
 
-Results are saved in two formats:
+The pipeline tracks detailed statistics:
 
-1. **Raw JSONL** (`function_calling_results_*.jsonl`): Full task data with metadata
-2. **ShareGPT JSONL** (`function_calling_sharegpt_*.jsonl`): Training-ready format
-
-### ShareGPT Example
-
-```json
-{
-  "conversations": [
-    {"from": "system", "value": "You are a helpful assistant..."},
-    {"from": "human", "value": "Order pizza from DoorDash"},
-    {"from": "gpt", "value": "Tool Calls:\n[{\"name\": \"order_food\", ...}]"},
-    {"from": "tool", "value": "[order_food]: {\"order_id\": \"123\", ...}"},
-    {"from": "gpt", "value": "I've placed your order..."},
-    {"from": "human", "value": "What's the delivery time?"},
-    {"from": "gpt", "value": "Tool Calls:\n[{\"name\": \"get_order_status\", ...}]"},
-    {"from": "tool", "value": "[get_order_status]: {\"eta\": \"30 mins\", ...}"},
-    {"from": "gpt", "value": "Your order will arrive in 30 minutes."}
-  ],
-  "tools": [...],
-  "metadata": {"id": "...", "mode": "curriculum"}
-}
+```
+=== Processing Statistics ===
+Total processed:     100
+Successful:          95
+Multi-turn samples:  80
+Clarification flows: 5
+Analysis follow-ups: 70
+Reasoning generated: 285
+Missing think blocks:3
+Truncated convos:    2
+Malformed tool calls:1
+...
+Success rate:        95.0%
 ```
 
-## Curriculum Format
+## Key Behaviors
 
-### CSV Format
+### Reasoning Mode (`generate_reasoning=True`)
 
-```csv
-Category,SubCategory,Task
-Use Apps,Food delivery apps,Order Food from Doordash
-Use Apps,Ride-hailing apps,Call a Uber
-```
+- System prompt includes deep thinking instructions
+- Tools embedded in system prompt as XML (`<tools>...</tools>`)
+- All assistant turns MUST have `<think>` blocks
+- Tool calls use `<tool_call>` XML tags (Hermes format)
+- Missing `<think>` blocks cause task failure or truncation
 
-### JSONL Format
+### Truncation Logic
 
-```json
-{"category": "Use Apps", "subcategory": "Food delivery apps", "task": "Order Food from Doordash"}
-{"category": "Use Apps", "subcategory": "Ride-hailing apps", "task": "Call a Uber"}
-```
+When final turns are invalid (missing `<think>` or malformed), the pipeline truncates to the last valid assistant turn instead of failing the entire task. This preserves valuable tool-calling data.
+
+### Analysis Follow-up
+
+After successful tool calling, generates a follow-up Q&A that:
+- Asks a question answerable from existing tool results
+- Requires reasoning over context (no new tool calls)
+- Includes `<think>` block in the response
 
 ## Environment Variables
 
-Set these in your `.env` file:
-
 ```bash
-OPENAI_KEY=your_openai_key
+OPENAI_API_KEY=your_openai_key
 ANTHROPIC_API_KEY=your_anthropic_key
-LITELLM_API_KEY=your_litellm_key  # If using LiteLLM proxy
+LITELLM_API_KEY=your_litellm_key
 LITELLM_ENDPOINT=http://localhost:8000/v1/chat/completions
 ```
 
 ## Reference
 
-This pipeline replaces the legacy `datagenie/hermes_function_calling/datagen_salesforce.py` which used the old `src/` framework. The original is preserved for reference.
+This pipeline replaces the legacy `datagenie/hermes_function_calling/datagen_salesforce.py` which used the old `src/` framework.
