@@ -1,0 +1,69 @@
+# Agent-Specific LLM Configuration
+# Each agent can have its own model, client, and parameters
+
+tool_generator:
+  #client: "anthropic"
+  #model: "claude-3-5-sonnet-20241022"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.4
+  max_tokens: 4096
+
+query_generator:
+  #client: "openai"
+  #model: "gpt-4o"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.6
+  max_tokens: 2048
+
+docstring_generator:
+  #client: "anthropic"
+  #model: "claude-3-5-sonnet-20241022"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.2
+  max_tokens: 2048
+
+schema_generator:
+  #client: "anthropic"
+  #model: "claude-3-5-sonnet-20241022"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.2
+  max_tokens: 2048
+
+results_generator:
+  #client: "anthropic"
+  #model: "claude-3-5-sonnet-20241022"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.4
+  max_tokens: 4096
+
+followup_generator:
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.6
+  max_tokens: 2048
+
+clarification_agent:
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.6
+  max_tokens: 2048
+
+tool_calling:
+  #client: "openai"
+  #model: "gpt-4o"
+  client: "litellm"
+  model: "Hermes-4-405B"
+  temperature: 0.2
+  max_tokens: 2048
+
+analysis_followup:
+  # Generates non-tool-calling follow-up Q&A that analyzes existing tool results
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.6
+  max_tokens: 2048
