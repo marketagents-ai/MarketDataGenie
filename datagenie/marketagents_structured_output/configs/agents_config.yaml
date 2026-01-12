@@ -1,0 +1,53 @@
+# Agent LLM Configuration for Structured Output Pipeline
+
+# Schema Generator - Creates JSON schemas from task descriptions
+schema_generator:
+  #client: "anthropic"
+  #model: "claude-3-5-sonnet-20241022"
+  client: "litellm"
+  model: "Hermes-4-405B"
+  temperature: 0.3
+  max_tokens: 2048
+
+# Query Generator - Creates user queries for structured output
+query_generator:
+  #client: "openai"
+  #model: "gpt-4o"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.6
+  max_tokens: 2048
+
+# Structured Output Agent - Generates JSON conforming to schema
+structured_output:
+  client: "litellm"
+  model: "Hermes-4-405B"
+  temperature: 0.4
+  max_tokens: 2048
+
+# Follow-up Generator - Creates follow-up queries for multi-turn
+followup_generator:
+  #client: "openai"
+  #model: "gpt-4o"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.6
+  max_tokens: 2048
+
+# Analysis Follow-up - Generates analysis Q&A
+analysis_followup:
+  #client: "openai"
+  #model: "gpt-4o"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.6
+  max_tokens: 2048
+
+# Clarification Agent - Generates user clarification when assistant asks for more info
+clarification_agent:
+  #client: "openai"
+  #model: "gpt-4o"
+  client: "litellm"
+  model: "Hermes-4-70B"
+  temperature: 0.6
+  max_tokens: 2048

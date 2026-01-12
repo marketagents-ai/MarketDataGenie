@@ -1,0 +1,38 @@
+# Structured Output Dataset Generation Pipeline Config
+
+# Mode: "curriculum" or "huggingface"
+mode: "curriculum"
+
+# Curriculum settings
+curriculum:
+  file: "configs/curriculum/json_mode.csv"
+  categories: []  # Empty = all categories
+  subcategories: []
+
+# HuggingFace dataset settings (for augmentation mode)
+huggingface:
+  dataset_name: "interstellarninja/json-mode-singleturn"
+  split: "train"
+
+# Generation settings
+generation:
+  batch_size: 8
+  max_turns: 4  # Total turns: 1 initial + (max_turns-1) modification follow-ups + 1 analysis follow-up
+  per_task_timeout: 300
+  generate_schema: true        # Generate schema if not in curriculum
+  generate_followup: true      # Generate multi-turn follow-ups
+  generate_analysis_followup: true  # Generate analysis Q&A
+  generate_reasoning: true    # Enable <think> blocks
+  validate_reasoning: true
+  allow_clarification_flow: true  # Allow clarification when model asks for more info
+  require_json_on_first_turn: false
+  max_clarification_turns: 2
+
+# Output settings
+output:
+  dir: "outputs/structured_output"
+  sharegpt: true
+  debug_print_messages: true
+
+# Agents config file
+agents_config: "configs/agents_config.yaml"
