@@ -1,0 +1,22 @@
+services:
+  pythonformer-repl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5003:5003"
+    volumes:
+      # Persist workspace between restarts (optional)
+      - pythonformer_workspace:/app/workspace
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    # Resource limits for safety
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+
+volumes:
+  pythonformer_workspace:
