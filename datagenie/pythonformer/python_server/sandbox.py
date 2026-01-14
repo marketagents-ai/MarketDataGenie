@@ -26,6 +26,14 @@ from pathlib import Path
 
 
 @dataclass
+class SubAgentCall:
+    """Record of a sub-agent invocation."""
+    task: str
+    system_prompt: Optional[str]
+    response: str
+
+
+@dataclass
 class ExecutionResult:
     """Result of code execution in sandbox."""
     success: bool
@@ -36,6 +44,7 @@ class ExecutionResult:
     execution_time_ms: int = 0
     files_created: List[str] = field(default_factory=list)
     files_modified: List[str] = field(default_factory=list)
+    sub_agent_calls: List[SubAgentCall] = field(default_factory=list)
 
 
 class PythonSandbox:
@@ -83,6 +92,9 @@ class PythonSandbox:
         # Track file changes
         self._initial_files: set = set()
         self._scan_workspace()
+        
+        # Track sub-agent calls during execution
+        self._sub_agent_calls: List[SubAgentCall] = []
         
         # Initialize sandbox namespace
         self._namespace: Dict[str, Any] = {}
@@ -143,8 +155,11 @@ class PythonSandbox:
         
         self._namespace['__builtins__'] = safe_builtins
         self._namespace['answer'] = {"content": "", "ready": False}
-        self._namespace['llm_query'] = self._llm_query_wrapper
-        self._namespace['llm_batch'] = self._llm_batch_wrapper
+        # Sub-agent for additional analysis (async LLM calls)
+        self._namespace['sub_agent'] = self._sub_agent_wrapper
+        self._namespace['sub_agent_batch'] = self._sub_agent_batch_wrapper
+        # Legacy alias
+        self._namespace['llm_query'] = self._sub_agent_wrapper
         
         if self.enable_filesystem:
             self._namespace['workspace'] = str(self.workspace_dir)
@@ -220,33 +235,79 @@ class PythonSandbox:
             except ImportError:
                 pass
     
-    def _llm_query_wrapper(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        """Query a sub-LLM with a single prompt."""
-        results = self._llm_batch_wrapper([prompt], None, system_prompt)
-        return results[0] if results else "[No response from sub-LLM]"
+    def _sub_agent_wrapper(
+        self, 
+        task: str, 
+        system_prompt: Optional[str] = None,
+        context: Optional[str] = None
+    ) -> str:
+        """
+        Invoke a sub-agent for semantic analysis.
+        
+        Args:
+            task: The task/question for the sub-agent
+            system_prompt: Optional system prompt (defaults to helpful assistant)
+            context: Optional context to include (will be wrapped in <file> tags)
+        
+        Returns:
+            Sub-agent response string
+        """
+        import requests
+        
+        # Get the server URL from environment or use default
+        server_url = os.environ.get("LLM_QUERY_URL", "http://localhost:5003/sub_agent")
+        
+        # Get sub-agent config from sandbox (set during session creation)
+        sub_config = getattr(self, 'sub_agent_config', {})
+        
+        response_text = ""
+        try:
+            payload = {
+                "task": task,
+                "model": sub_config.get("model", "Hermes-4-70B"),
+                "client": sub_config.get("client", "litellm"),
+                "max_tokens": sub_config.get("max_tokens", 2048),
+                "temperature": sub_config.get("temperature", 0.3),
+            }
+            if system_prompt:
+                payload["system_prompt"] = system_prompt
+            if context:
+                payload["context"] = context
+            
+            resp = requests.post(server_url, json=payload, timeout=120)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                response_text = data.get("response", "[No response]")
+            else:
+                response_text = f"[Sub-agent call failed: HTTP {resp.status_code}]"
+                
+        except requests.exceptions.ConnectionError:
+            # If server endpoint not available, return placeholder
+            response_text = f"[sub_agent not available - task: {task[:100]}...]"
+        except Exception as e:
+            response_text = f"[sub_agent error: {str(e)}]"
+        
+        # Record the call for observation formatting
+        self._sub_agent_calls.append(SubAgentCall(
+            task=task[:200] + "..." if len(task) > 200 else task,
+            system_prompt=system_prompt,
+            response=response_text
+        ))
+        
+        return response_text
     
-    def _llm_batch_wrapper(
-        self, prompts: List[str], tools: Optional[List[str]] = None,
+    def _sub_agent_batch_wrapper(
+        self, 
+        tasks: List[str], 
         system_prompt: Optional[str] = None
     ) -> List[str]:
-        """Query sub-LLMs in parallel with multiple prompts."""
-        if self.llm_batch_callback is None:
-            return [f"[llm_batch not configured - prompt: {p[:100]}...]" for p in prompts]
-        
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                future = asyncio.run_coroutine_threadsafe(
-                    self.llm_batch_callback(prompts, tools, system_prompt), loop
-                )
-                return future.result(timeout=self.timeout_seconds)
-            else:
-                return loop.run_until_complete(
-                    self.llm_batch_callback(prompts, tools, system_prompt)
-                )
-        except Exception as e:
-            return [f"[llm_batch error: {str(e)}]" for _ in prompts]
+        """Invoke sub-agents with multiple tasks (sequential for now)."""
+        results = []
+        for task in tasks:
+            result = self._sub_agent_wrapper(task, system_prompt)
+            results.append(result)
+        return results
     
     def _truncate_output(self, output: str) -> Tuple[str, bool]:
         """Truncate output to configured limits."""
@@ -270,6 +331,9 @@ class PythonSandbox:
         """Execute Python code in the sandbox."""
         import time
         start_time = time.time()
+        
+        # Clear sub-agent calls from previous execution
+        self._sub_agent_calls = []
         
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
@@ -306,11 +370,22 @@ class PythonSandbox:
             combined_output += f"\n[error]: {result.error}"
         
         result.output, result.truncated = self._truncate_output(combined_output)
-        result.answer_state = self._namespace.get('answer', {}).copy()
+        
+        # Safely get answer state (model might have overwritten the answer variable)
+        answer_val = self._namespace.get('answer', {})
+        if isinstance(answer_val, dict):
+            result.answer_state = answer_val.copy()
+        else:
+            # Model overwrote answer with a non-dict value
+            result.answer_state = {"content": str(answer_val), "ready": True}
+        
         result.execution_time_ms = int((time.time() - start_time) * 1000)
         
         if self.enable_filesystem:
             result.files_created, result.files_modified = self._get_file_changes()
+        
+        # Include sub-agent calls made during this execution
+        result.sub_agent_calls = self._sub_agent_calls.copy()
         
         self.history.append((code, result))
         return result
@@ -345,8 +420,8 @@ class PythonSandbox:
     def get_namespace_summary(self) -> Dict[str, str]:
         """Get a summary of variables in the namespace."""
         summary = {}
-        skip_keys = {'__builtins__', 'llm_query', 'llm_batch', 'save_to_file', 
-                     'read_file', 'list_files', 'file_exists', 'workspace'}
+        skip_keys = {'__builtins__', 'sub_agent', 'sub_agent_batch', 'llm_query',
+                     'save_to_file', 'read_file', 'list_files', 'file_exists', 'workspace'}
         
         for key, value in self._namespace.items():
             if key in skip_keys:
@@ -368,8 +443,8 @@ class PythonSandbox:
         import inspect
         import types
         
-        skip_keys = {'__builtins__', 'llm_query', 'llm_batch', 'save_to_file', 
-                     'read_file', 'list_files', 'file_exists', 'workspace', 'context'}
+        skip_keys = {'__builtins__', 'sub_agent', 'sub_agent_batch', 'llm_query',
+                     'save_to_file', 'read_file', 'list_files', 'file_exists', 'workspace', 'context'}
         
         variables, functions, classes, modules = {}, {}, {}, []
         
@@ -438,6 +513,12 @@ class PythonSandbox:
                 else:
                     var_strs.append(f"{name}: {info['type']}")
             parts.append(f"vars: {', '.join(var_strs)}")
+        
+        # Add workspace files
+        if self.enable_filesystem:
+            files = self._list_files("*")
+            if files:
+                parts.append(f"files: {', '.join(files)}")
         
         return " | ".join(parts) if parts else "(empty state)"
 

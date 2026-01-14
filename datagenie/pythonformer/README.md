@@ -75,6 +75,8 @@ flowchart TD
 - **Answer validation**: Extracts `\boxed{}` answers and compares with expected
 - **Hallucination detection**: Strips model-generated `<repl>`/`<state>` tags
 - **Streaming datasets**: Avoids downloading large HuggingFace datasets
+- **Long-context support**: OOLONG environment with sub-agent for chunked semantic analysis
+- **Sub-agent integration**: Hierarchical LLM calls for map-reduce style processing
 
 ## XML Format
 
@@ -103,6 +105,43 @@ The solutions are $x = \boxed{2}$ and $x = \boxed{-2}$.
 </final_answer>
 ```
 
+### Long-Context XML Format (OOLONG)
+
+For long-context tasks, the pipeline uses additional tags for file input and sub-agent responses:
+
+```xml
+<!-- Long context provided as file reference -->
+<file name="context.txt" type="txt" chars="152445">
+[Content saved to workspace - use read_file('context.txt') to load]
+</file>
+
+<!-- Assistant uses sub-agent for semantic analysis of chunks -->
+<python>
+context = read_file('context.txt')
+lines = context.split('\n')
+chunk = '\n'.join(lines[0:200])
+
+# Sub-agent counts rolls in this chunk
+count = sub_agent(
+    task=f"Count dice rolls in this D&D transcript. Return just the number.\n\n{chunk}",
+    system_prompt="You count dice rolls. Return only an integer."
+)
+print(f"Rolls in chunk: {count}")
+</python>
+
+<!-- System returns REPL output + sub-agent response -->
+<repl>
+Rolls in chunk: 12
+</repl>
+<sub_agent task="Count dice rolls in this D&D transcript...">
+12
+</sub_agent>
+<state>
+imports: re, json | vars: context: str, lines: list[1653], chunk: str, count='12'
+files: context.txt
+</state>
+```
+
 ## Installation
 
 ```bash
@@ -129,11 +168,14 @@ python -m datagenie.pythonformer.python_server.server --port 5003
 ### 2. Run the Pipeline
 
 ```bash
-# Basic usage
+# Basic usage (math problems)
 python -m datagenie.pythonformer.run --config datagenie/pythonformer/configs/default_config.yaml --limit 10
 
+# Long-context tasks (OOLONG)
+python -m datagenie.pythonformer.run --config datagenie/pythonformer/configs/oolong_config.yaml --limit 4
+
 # With debug output (colored pretty printing)
-python -m datagenie.pythonformer.run --config datagenie/pythonformer/configs/default_config.yaml --limit 5 --debug
+python -m datagenie.pythonformer.run --config datagenie/pythonformer/configs/oolong_config.yaml --limit 2 --debug
 ```
 
 ## Configuration
@@ -164,6 +206,45 @@ dataset:
     prompt: "problem"
     expected_answer: "expected_answer"
   output_dir: "outputs/pythonformer"
+  output_sharegpt: true
+  batch_size: 4
+```
+
+### Long-Context Config (`configs/oolong_config.yaml`)
+
+```yaml
+# Main LLM (orchestrator)
+main_model: "Hermes-4-405B"
+main_client: "litellm"
+main_temperature: 0.7
+main_max_tokens: 4096
+
+# Sub-LLM for sub_agent() calls (chunked analysis)
+sub_model: "Hermes-4-70B"
+sub_client: "litellm"
+sub_temperature: 0.3
+sub_max_tokens: 2048
+
+# REPL settings
+repl:
+  server_url: "http://localhost:5003"
+  max_output_chars: 8192
+  max_turns: 10  # More turns for long-context exploration
+  timeout_seconds: 180
+
+# Dataset settings
+dataset:
+  environment: "oolong"
+  dataset_name: "oolongbench/oolong-real"
+  dataset_config: "dnd"
+  dataset_split: "validation"
+  field_mapping:
+    id: "id"
+    prompt: "question"
+    expected_answer: "answer"
+    context: "context_window_text"
+  context_processor: "oolong"
+  output_dir: "outputs/pythonformer_oolong"
   output_sharegpt: true
   batch_size: 4
 ```
@@ -218,7 +299,7 @@ datagenie/pythonformer/
 ├── python_server/               # REPL server (Docker)
 │   ├── __init__.py
 │   ├── sandbox.py               # PythonSandbox with state tracking
-│   ├── server.py                # Flask REST API
+│   ├── server.py                # Flask REST API + sub_agent endpoint
 │   ├── Dockerfile
 │   ├── docker-compose.yml
 │   └── start_server.sh
@@ -226,7 +307,8 @@ datagenie/pythonformer/
 │   ├── __init__.py
 │   └── debug.py                 # Colored pretty printing
 └── configs/
-    └── default_config.yaml
+    ├── default_config.yaml      # Math problem solving
+    └── oolong_config.yaml       # Long-context analysis
 ```
 
 ## REPL Server API
@@ -238,6 +320,7 @@ datagenie/pythonformer/
 | `/session/{id}/state` | GET | Get session state |
 | `/session/{id}/reset` | POST | Reset session |
 | `/session/{id}` | DELETE | Delete session |
+| `/sub_agent` | POST | Invoke sub-agent for semantic analysis |
 | `/execute` | POST | Stateless single execution |
 | `/health` | GET | Health check |
 
@@ -256,7 +339,29 @@ datagenie/pythonformer/
     "classes": {},
     "modules": ["sympy"]
   },
-  "state_formatted": "imports: sympy | vars: x=Symbol('x'), result: list[2]"
+  "state_formatted": "imports: sympy | vars: x=Symbol('x'), result: list[2]",
+  "sub_agent_calls": []
+}
+```
+
+### Sub-Agent Request/Response
+
+```json
+// Request
+{
+  "task": "Count dice rolls in this text. Return just the number.\n\nTravis: I roll a 15...",
+  "system_prompt": "You count dice rolls. Return only an integer.",
+  "model": "Hermes-4-70B",
+  "client": "litellm",
+  "max_tokens": 2048,
+  "temperature": 0.3
+}
+
+// Response
+{
+  "response": "3",
+  "model": "Hermes-4-70B",
+  "client": "litellm"
 }
 ```
 
@@ -348,3 +453,127 @@ If sympy/numpy/etc. not found, the server is running outside Docker without pack
 ### State Pollution Between Tasks
 
 Fixed in latest version - each task now creates its own `REPLClient` instance for session isolation.
+
+## Long-Context Pipeline (OOLONG)
+
+The OOLONG environment is designed for long-context document analysis tasks where the context is too large to process in a single LLM pass.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    subgraph Input["📥 Long Context Input"]
+        A[OOLONG Dataset<br/><i>D&D transcripts ~150K chars</i>]
+        A --> B[Save to Workspace<br/><i>context.txt</i>]
+    end
+
+    subgraph MainAgent["🤖 Main Agent (Hermes-4-405B)"]
+        B --> C[Load & Explore Context]
+        C --> D[Chunk Strategy]
+        D --> E{Analysis Type?}
+        
+        E -->|Syntactic| F[Regex/Python<br/><i>pattern matching</i>]
+        E -->|Semantic| G[Sub-Agent Calls<br/><i>map-reduce</i>]
+    end
+
+    subgraph SubAgent["🔧 Sub-Agent (Hermes-4-70B)"]
+        G --> H[Process Chunk]
+        H --> I[Return Result<br/><i>single number/value</i>]
+        I --> J[Aggregate Results]
+    end
+
+    subgraph Output["📊 Final Answer"]
+        F --> K[Combine Results]
+        J --> K
+        K --> L[\\boxed Answer]
+    end
+
+    style C fill:#e1f5fe
+    style G fill:#fff3e0
+    style H fill:#e8f5e9
+    style L fill:#e8f5e9
+```
+
+### Sub-Agent Pattern
+
+The main agent (405B) orchestrates while the sub-agent (70B) handles semantic analysis of chunks:
+
+```python
+# Main agent code - chunked map-reduce
+context = read_file('context.txt')
+lines = context.split('\n')
+chunk_size = 200
+results = []
+
+for i in range(0, len(lines), chunk_size):
+    chunk = '\n'.join(lines[i:i+chunk_size])
+    
+    # Sub-agent analyzes each chunk
+    count = sub_agent(
+        task=f"Count dice rolls in this chunk. Return just the number.\n\n{chunk}",
+        system_prompt="You count dice rolls. Return only an integer."
+    )
+    results.append(int(count) if count.isdigit() else 0)
+    print(f"Chunk {i//chunk_size}: {results[-1]} rolls")
+
+total = sum(results)
+print(f"Total rolls: {total}")
+```
+
+### Sub-Agent Function Signature
+
+```python
+sub_agent(
+    task: str,                    # The question/task for the sub-agent
+    system_prompt: str = None,    # Optional system prompt
+    context: str = None           # Optional context (wrapped in <file> tags)
+) -> str                          # Returns sub-agent response
+```
+
+### When to Use Sub-Agent
+
+| Task Type | Use Sub-Agent? | Example |
+|-----------|----------------|---------|
+| Pattern counting | No - use regex | Count "rolls a \d+" patterns |
+| Semantic counting | Yes | "How many times did Fjord attack?" |
+| Classification | Yes | "Is this chunk about combat?" |
+| Extraction | Yes | "What items were found in this scene?" |
+| Aggregation | No - use Python | Sum chunk results |
+
+### OOLONG Dataset
+
+The pipeline supports the [OOLONG benchmark](https://huggingface.co/datasets/oolongbench/oolong-real) for long-context evaluation:
+
+- **D&D transcripts**: ~150K character episode transcripts
+- **Tasks**: Counting, aggregation, reasoning over long documents
+- **Expected answers**: Ground truth for validation
+
+### Example Output
+
+```
+============================================================
+Task: 3952f2d5-082f-14b2-5ec4-d9cbedd2f865         
+============================================================
+Prompt: Total number of rolls in this episode?
+Expected: 84
+Saved context to context.txt (152,445 chars)
+
+▶ Executing Code Block #1
+<python>
+context = read_file('context.txt')
+lines = context.split('\n')
+# ... chunked analysis with sub_agent() ...
+</python>
+
+<sub_agent> task: Count dice rolls in this chunk...
+response: 12
+<sub_agent> task: Count dice rolls in this chunk...
+response: 8
+...
+
+<final_answer>
+The total number of rolls in this episode is \boxed{84}.
+</final_answer>
+
+✅ Answer correct: 84 == 84
+```

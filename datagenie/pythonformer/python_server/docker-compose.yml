@@ -10,6 +10,13 @@ services:
       - pythonformer_workspace:/app/workspace
     environment:
       - PYTHONUNBUFFERED=1
+      # API keys - set these in your shell or use: docker-compose --env-file ../../../.env up
+      - OPENAI_API_KEY=${OPENAI_KEY:-${OPENAI_API_KEY}}
+      - LITELLM_API_KEY=${LITELLM_API_KEY}
+      - LITELLM_ENDPOINT=${LITELLM_ENDPOINT}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # For sub_agent calls from sandbox (localhost inside container)
+      - LLM_QUERY_URL=http://localhost:5003/sub_agent
     restart: unless-stopped
     # Resource limits for safety
     deploy:

@@ -33,7 +33,7 @@ from tqdm.asyncio import tqdm
 from datagenie.pythonformer.config import (
     PythonformerConfig, EnvironmentType, ENV_TIPS, LLMClientType
 )
-from datagenie.pythonformer.repl_client import REPLClient, ExecutionResult
+from datagenie.pythonformer.repl_client import REPLClient, ExecutionResult, SubAgentCall
 from datagenie.pythonformer.utils.debug import (
     Colors, print_colored, print_header, print_subheader,
     print_code_block, print_repl_output, print_state,
@@ -56,6 +56,7 @@ class TrajectoryResult:
     final_answer: str
     turns: List[Turn]
     num_code_blocks: int = 0
+    system_prompt: str = ""  # The system prompt used for this trajectory
 
 
 @dataclass
@@ -168,7 +169,7 @@ The answer is $\\boxed{{42}}$.
 1. NEVER give <final_answer> without executing at least one <python> block first
 2. ALWAYS write code to solve the problem - do not solve mentally
 3. Do NOT include <final_answer> in the same response as <python> blocks
-4. Do NOT generate <repl> or <state> tags - those are provided by the system after execution
+4. Do NOT generate <repl>, <state>, or <sub_agent> tags - those are provided by the system
 5. After writing <python> code, STOP and wait for execution results
 6. Always put your final numerical/symbolic answer inside \\boxed{{}}
 7. If your first approach fails, try alternative methods in code
@@ -194,9 +195,15 @@ Use this state information to track what's available for subsequent code blocks.
 ## Available in the Python Environment
 
 - Standard library and common packages (numpy, pandas, sympy, scipy, json, re, etc.)
-- `llm_query(prompt)` - Query a sub-LLM for semantic analysis
+- `sub_agent(task, system_prompt=None)` - Invoke a sub-agent for semantic analysis
 
 ## Filesystem for Dynamic Context
+
+Files are provided in <file> tags with name and type attributes:
+<file name="data.csv" type="csv">
+col1,col2
+1,2
+</file>
 
 - `save_to_file(filename, content)` - Save content to workspace
 - `read_file(filename, lines=N)` - Read file (optionally last N lines)  
@@ -210,6 +217,121 @@ Use this state information to track what's available for subsequent code blocks.
 - Only use <final_answer> AFTER you have executed code and verified your solution
 - Always include \\boxed{{}} around your final answer for validation
 - If symbolic solving fails, try numerical methods
+- Do NOT use `answer` as a variable name - it is reserved for the system
+
+{env_tips}
+"""
+
+    OOLONG_SYSTEM_PROMPT = """You are Pythonformer AI assistant that solves long-context problems by programmatically analyzing documents with Python code.
+
+## CRITICAL: Long Context Strategy
+
+The context document is TOO LARGE to process in one pass. It has been saved to your workspace ({context_length:,} characters). You MUST use Python to:
+
+1. Load and explore the context structure
+2. Search, filter, and chunk as needed
+3. Use `sub_agent()` for semantic analysis of chunks
+4. Aggregate results programmatically
+5. Verify your answer before submitting
+
+## File Input Format
+
+Long context files are provided in <file> tags:
+<file name="context.txt" type="txt" chars="{context_length}">
+[Content saved to workspace - use read_file('context.txt') to load]
+</file>
+
+## Response Format
+
+Use <python> tags for code, <final_answer> for your answer:
+
+<python>
+# Step 1: Load and explore the context
+context = read_file('context.txt')
+lines = context.strip().split('\\n')
+print(f"Total lines: {{len(lines)}}")
+print(f"First 5 lines:\\n{{chr(10).join(lines[:5])}}")
+</python>
+
+## Available Tools
+
+### File Operations
+- `read_file('context.txt')` - Load the full context
+- `read_file('context.txt', lines=100)` - Read last 100 lines
+- `save_to_file(name, content)` - Save intermediate results
+- `list_files(pattern)` - List workspace files
+
+### Sub-Agent for Semantic Analysis
+- `sub_agent(task, system_prompt=None)` - Invoke a sub-agent for semantic tasks
+
+Use `sub_agent()` when you need semantic understanding. The response appears in <sub_agent> tags:
+<python>
+# Example: Classify or extract meaning from a chunk
+chunk = '\\n'.join(lines[0:50])
+result = sub_agent(
+    task=f"How many dice rolls are mentioned in this text? Return just the number.\\n\\nText:\\n{{chunk}}",
+    system_prompt="You are a precise counter. Return only the number."
+)
+print(f"Rolls in chunk: {{result}}")
+</python>
+
+The system returns sub-agent responses in <sub_agent> tags:
+<sub_agent task="How many dice rolls...">
+12
+</sub_agent>
+
+### Python Standard Library
+- `re` for regex search/matching
+- `collections.Counter` for counting
+- String methods: split, find, count, etc.
+
+## Strategy Examples
+
+### Counting Pattern Occurrences
+<python>
+import re
+context = read_file('context.txt')
+# Count all dice rolls like "rolls a 15" or "rolled 20"
+rolls = re.findall(r'rolls?\\s+(?:a\\s+)?(\\d+)', context, re.IGNORECASE)
+print(f"Found {{len(rolls)}} rolls")
+print(f"Sample rolls: {{rolls[:10]}}")
+</python>
+
+### Chunked Semantic Analysis with Sub-Agent
+<python>
+context = read_file('context.txt')
+lines = context.split('\\n')
+chunk_size = 200
+results = []
+
+for i in range(0, min(len(lines), 1000), chunk_size):
+    chunk = '\\n'.join(lines[i:i+chunk_size])
+    count = sub_agent(
+        task=f"Count dice rolls in this D&D transcript chunk. Return just the number.\\n\\n{{chunk}}",
+        system_prompt="You count dice rolls. Return only an integer."
+    )
+    results.append(int(count) if count.isdigit() else 0)
+    print(f"Chunk {{i//chunk_size}}: {{results[-1]}} rolls")
+
+total = sum(results)
+print(f"Total rolls: {{total}}")
+</python>
+
+## IMPORTANT RULES
+
+1. NEVER try to read the entire context in one LLM response - use Python
+2. ALWAYS execute code before giving <final_answer>
+3. Use `sub_agent()` for semantic tasks (understanding meaning, classification)
+4. Use Python/regex for syntactic tasks (counting patterns, searching)
+5. Put your final answer in \\boxed{{}}
+6. Do NOT generate <repl>, <state>, or <sub_agent> tags - system provides those
+7. Do NOT use `answer` as a variable name - it is reserved for the system
+
+## Final Answer Format
+
+<final_answer>
+The answer is \\boxed{{84}}.
+</final_answer>
 
 {env_tips}
 """
@@ -262,9 +384,17 @@ Use this state information to track what's available for subsequent code blocks.
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     
-    def _build_system_prompt(self, env_type: EnvironmentType) -> str:
+    def _build_system_prompt(self, env_type: EnvironmentType, context_length: int = 0) -> str:
         """Build system prompt with environment-specific tips."""
         env_tips = ENV_TIPS.get(env_type, "")
+        
+        # Use OOLONG-specific prompt for long-context tasks
+        if env_type == EnvironmentType.OOLONG:
+            return self.OOLONG_SYSTEM_PROMPT.format(
+                context_length=context_length,
+                env_tips=env_tips
+            )
+        
         return self.SYSTEM_PROMPT.format(
             max_output=self.config.repl.max_output_chars,
             env_tips=env_tips
@@ -294,17 +424,20 @@ Use this state information to track what's available for subsequent code blocks.
     
     def _has_hallucinated_repl(self, text: str) -> bool:
         """
-        Check if the model hallucinated REPL output in its response.
+        Check if the model hallucinated system output in its response.
         
-        The model should NOT generate <repl> or <state> tags - those come from
-        the actual REPL execution. If we see them in the assistant response,
-        the model is hallucinating.
+        The model should NOT generate <repl>, <state>, or <sub_agent> tags - 
+        those come from actual execution. If we see them in the assistant 
+        response, the model is hallucinating.
         """
         # Check for <repl> tags in assistant response
         if re.search(r'<repl>', text):
             return True
         # Check for <state> tags in assistant response
         if re.search(r'<state>', text):
+            return True
+        # Check for <sub_agent> tags in assistant response
+        if re.search(r'<sub_agent', text):
             return True
         return False
     
@@ -390,13 +523,43 @@ Use this state information to track what's available for subsequent code blocks.
         # This is critical for parallel execution - each task needs its own session
         repl_client = REPLClient(server_url=self.config.repl.server_url)
         
+        # For OOLONG/long-context: don't pass context to session (too large)
+        # Instead we'll save it to file after session creation
+        session_context = None if env_type == EnvironmentType.OOLONG else context
+        
+        # Build sub-agent config from pipeline config
+        sub_agent_config = {
+            "model": self.config.sub_llm.model,
+            "client": self.config.sub_llm.client.value,
+            "temperature": self.config.sub_llm.temperature,
+            "max_tokens": self.config.sub_llm.max_tokens,
+        }
+        
         # Create REPL session
         repl_client.create_session(
-            context=context,
-            max_output_chars=self.config.repl.max_output_chars
+            context=session_context,
+            max_output_chars=self.config.repl.max_output_chars,
+            sub_agent_config=sub_agent_config
         )
         
         try:
+            # For OOLONG: save context to file via code execution
+            context_length = len(context) if context else 0
+            if env_type == EnvironmentType.OOLONG and context:
+                # Save context to file - escape for Python string
+                # Use a chunked approach to avoid huge string literals
+                chunk_size = 50000
+                for i in range(0, len(context), chunk_size):
+                    chunk = context[i:i+chunk_size]
+                    # Escape the chunk for Python
+                    escaped_chunk = chunk.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '\\r')
+                    mode = 'w' if i == 0 else 'a'
+                    init_code = f"with open('context.txt', '{mode}') as f: f.write('{escaped_chunk}')"
+                    repl_client.execute(init_code)
+                
+                if self.config.debug:
+                    print(f"Saved context to context.txt ({context_length:,} chars)")
+            
             turns: List[Turn] = []
             num_code_blocks = 0
             
@@ -404,10 +567,17 @@ Use this state information to track what's available for subsequent code blocks.
             initial_state = repl_client.get_state()
             initial_state_str = initial_state.get("state_formatted", "")
             
+            # Build system prompt (with context length for OOLONG)
+            system_prompt = self._build_system_prompt(env_type, context_length)
+            
             # Initial user message
             user_msg = prompt
-            if context:
+            if context and env_type != EnvironmentType.OOLONG:
+                # For non-OOLONG: mention context variable
                 user_msg += f"\n\n[Context available as `context` variable ({len(context):,} chars) or in 'context.txt']"
+            elif context and env_type == EnvironmentType.OOLONG:
+                # For OOLONG: use <file> tag to indicate context location
+                user_msg += f'\n\n<file name="context.txt" type="txt" chars="{context_length}">\n[Content saved to workspace - use read_file(\'context.txt\') to load]\n</file>'
             
             # Optionally prepend initial state info
             if initial_state_str and initial_state_str != "(empty state)":
@@ -418,8 +588,21 @@ Use this state information to track what's available for subsequent code blocks.
             
             # Main generation loop
             for turn_idx in range(self.config.repl.max_turns):
+                # Nudge model to conclude if it's been running too long
+                if turn_idx >= 6 and num_code_blocks >= 3:
+                    # Add a gentle nudge to wrap up
+                    if turn_idx == 6:
+                        nudge = "\n\n[Note: You've executed several code blocks. If you have enough information, please provide your <final_answer> with \\boxed{} now.]"
+                        if messages[-1]["role"] == "tool":
+                            messages[-1]["content"] += nudge
+                    elif turn_idx >= 10:
+                        # Stronger nudge
+                        nudge = "\n\n[IMPORTANT: Please provide your <final_answer> now based on your analysis. Use \\boxed{} for the answer.]"
+                        if messages[-1]["role"] == "tool":
+                            messages[-1]["content"] += nudge
+                
                 # Generate response
-                response = await self._generate_response(messages, self.system_prompt)
+                response = await self._generate_response(messages, system_prompt)
                 
                 if not response:
                     break
@@ -427,10 +610,11 @@ Use this state information to track what's available for subsequent code blocks.
                 # Check for hallucinated REPL output - model should NOT generate these
                 if self._has_hallucinated_repl(response):
                     if self.config.debug:
-                        print(f"Warning: Model hallucinated <repl>/<state> tags - stripping them")
+                        print(f"Warning: Model hallucinated <repl>/<state>/<sub_agent> tags - stripping them")
                     # Strip hallucinated tags and re-extract
                     response = re.sub(r'<repl>.*?</repl>', '', response, flags=re.DOTALL)
                     response = re.sub(r'<state>.*?</state>', '', response, flags=re.DOTALL)
+                    response = re.sub(r'<sub_agent[^>]*>.*?</sub_agent>', '', response, flags=re.DOTALL)
                     response = response.strip()
                 
                 # Extract Python blocks first
@@ -472,11 +656,24 @@ Use this state information to track what's available for subsequent code blocks.
                         success=True,
                         final_answer=final_answer,
                         turns=turns,
-                        num_code_blocks=num_code_blocks
+                        num_code_blocks=num_code_blocks,
+                        system_prompt=system_prompt
                     )
                 
                 if not python_blocks:
                     # No code blocks and no valid final answer - model might be done or confused
+                    # Check if the response contains a boxed answer without proper tags
+                    boxed_in_response = self._extract_boxed_answers(response)
+                    if boxed_in_response and num_code_blocks > 0:
+                        if self.config.debug:
+                            print(f"Found \\boxed{{}} without <final_answer> tags - treating as final answer")
+                        return TrajectoryResult(
+                            success=True,
+                            final_answer=response,  # Use the whole response as final answer
+                            turns=turns,
+                            num_code_blocks=num_code_blocks,
+                            system_prompt=system_prompt
+                        )
                     break
                 
                 for code in python_blocks:
@@ -496,6 +693,10 @@ Use this state information to track what's available for subsequent code blocks.
                             execution_time_ms=result.execution_time_ms,
                             truncated=result.truncated
                         )
+                        # Print sub-agent calls
+                        for sub_call in result.sub_agent_calls:
+                            print_colored(f"  <sub_agent> task: {sub_call.task[:100]}...", Colors.CYAN)
+                            print_colored(f"  response: {sub_call.response}", Colors.GREEN)
                         if result.state_formatted and result.state_formatted != "(empty state)":
                             print_state(result.state_formatted)
                     
@@ -515,6 +716,11 @@ Use this state information to track what's available for subsequent code blocks.
                     # Build tool response with <repl> and <state> tags
                     repl_response = f"<repl>\n{obs_content}\n</repl>"
                     
+                    # Add sub-agent responses if any
+                    for sub_call in result.sub_agent_calls:
+                        task_preview = sub_call.task[:100] + "..." if len(sub_call.task) > 100 else sub_call.task
+                        repl_response += f'\n<sub_agent task="{task_preview}">\n{sub_call.response}\n</sub_agent>'
+                    
                     # Add state if there's meaningful state to show
                     if result.state_formatted and result.state_formatted != "(empty state)":
                         repl_response += f"\n<state>\n{result.state_formatted}\n</state>"
@@ -527,7 +733,8 @@ Use this state information to track what's available for subsequent code blocks.
                 success=False,
                 final_answer="",
                 turns=turns,
-                num_code_blocks=num_code_blocks
+                num_code_blocks=num_code_blocks,
+                system_prompt=system_prompt
             )
         
         finally:
@@ -546,8 +753,9 @@ Use this state information to track what's available for subsequent code blocks.
         """Format trajectory as ShareGPT conversation with system prompt."""
         conversations = []
         
-        # Always include system prompt
-        conversations.append({"from": "system", "value": self.system_prompt})
+        # Use per-trajectory system prompt (important for OOLONG with varying context lengths)
+        system_prompt = result.system_prompt if result.system_prompt else self.system_prompt
+        conversations.append({"from": "system", "value": system_prompt})
         
         for turn in result.turns:
             if turn.role == "user":
@@ -582,8 +790,9 @@ Use this state information to track what's available for subsequent code blocks.
         """Format trajectory with ChatML template."""
         parts = []
         
-        # Always include system prompt
-        parts.append(f"<|im_start|>system\n{self.system_prompt}<|im_end|>")
+        # Use per-trajectory system prompt (important for OOLONG with varying context lengths)
+        system_prompt = result.system_prompt if result.system_prompt else self.system_prompt
+        parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>")
         
         for turn in result.turns:
             if turn.role == "user":
@@ -880,6 +1089,10 @@ Use this state information to track what's available for subsequent code blocks.
             if self.config.debug:
                 import traceback
                 traceback.print_exc()
+            # Record failed task in stats
+            self.stats.total += 1
+            self.stats.failed += 1
+            self.stats.answers_unknown += 1
             return None
     
     # ============================================================
@@ -907,9 +1120,15 @@ Use this state information to track what's available for subsequent code blocks.
                     )
                 except asyncio.TimeoutError:
                     print(f"Task {task.get('id', 'unknown')} timed out")
+                    self.stats.total += 1
+                    self.stats.failed += 1
+                    self.stats.answers_unknown += 1
                     return None
                 except Exception as e:
                     print(f"Task {task.get('id', 'unknown')} failed: {e}")
+                    self.stats.total += 1
+                    self.stats.failed += 1
+                    self.stats.answers_unknown += 1
                     return None
         
         results = await asyncio.gather(*[process_with_semaphore(t) for t in tasks])
@@ -956,6 +1175,7 @@ Use this state information to track what's available for subsequent code blocks.
         
         # Print stats
         print(self.stats.report())
+        print(f"Tasks loaded: {len(tasks)}, Results collected: {len([r for r in all_results if r is not None])}")
         print(f"\nOutput files:")
         print(f"  Traces:   {self.results_file}")
         print(f"  ShareGPT: {self.sharegpt_file}")

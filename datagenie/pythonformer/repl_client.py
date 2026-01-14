@@ -12,6 +12,14 @@ from dataclasses import dataclass
 
 
 @dataclass
+class SubAgentCall:
+    """Record of a sub-agent invocation."""
+    task: str
+    system_prompt: Optional[str]
+    response: str
+
+
+@dataclass
 class ExecutionResult:
     """Result from code execution."""
     success: bool
@@ -24,6 +32,7 @@ class ExecutionResult:
     variables: Dict[str, str] = None
     state: Dict[str, Any] = None  # Full state snapshot
     state_formatted: str = None   # Formatted state string
+    sub_agent_calls: List[SubAgentCall] = None  # Sub-agent calls made during execution
     
     def __post_init__(self):
         if self.files_created is None:
@@ -36,6 +45,8 @@ class ExecutionResult:
             self.state = {"variables": {}, "functions": {}, "classes": {}, "modules": []}
         if self.state_formatted is None:
             self.state_formatted = "(empty state)"
+        if self.sub_agent_calls is None:
+            self.sub_agent_calls = []
 
 
 class REPLClient:
@@ -62,6 +73,7 @@ class REPLClient:
         context: Optional[str] = None,
         packages: Optional[List[str]] = None,
         max_output_chars: int = 8192,
+        sub_agent_config: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Create a new REPL session.
@@ -70,6 +82,7 @@ class REPLClient:
             context: Optional large context to make available
             packages: Python packages to pre-import
             max_output_chars: Max output truncation limit
+            sub_agent_config: Config for sub-agent calls (model, client, temperature, max_tokens)
             
         Returns:
             Session ID
@@ -79,6 +92,8 @@ class REPLClient:
             payload["context"] = context
         if packages:
             payload["packages"] = packages
+        if sub_agent_config:
+            payload["sub_agent_config"] = sub_agent_config
         
         resp = requests.post(
             f"{self.server_url}/session/create",
@@ -113,6 +128,16 @@ class REPLClient:
         resp.raise_for_status()
         data = resp.json()
         
+        # Parse sub-agent calls
+        sub_agent_calls = [
+            SubAgentCall(
+                task=c.get("task", ""),
+                system_prompt=c.get("system_prompt"),
+                response=c.get("response", "")
+            )
+            for c in data.get("sub_agent_calls", [])
+        ]
+        
         return ExecutionResult(
             success=data.get("success", False),
             output=data.get("output", ""),
@@ -124,6 +149,7 @@ class REPLClient:
             variables=data.get("variables", {}),
             state=data.get("state", {"variables": {}, "functions": {}, "classes": {}, "modules": []}),
             state_formatted=data.get("state_formatted", "(empty state)"),
+            sub_agent_calls=sub_agent_calls,
         )
     
     def get_state(self, session_id: Optional[str] = None) -> Dict[str, Any]:

@@ -101,6 +101,9 @@ def create_session():
     packages = data.get("packages", ["numpy", "pandas", "sympy", "json", "re", "math"])
     max_output = data.get("max_output_chars", MAX_OUTPUT_CHARS)
     
+    # Sub-agent config (passed from pipeline config)
+    sub_agent_config = data.get("sub_agent_config", {})
+    
     session_id = str(uuid.uuid4())[:8]
     
     sandbox = PythonSandbox(
@@ -108,6 +111,9 @@ def create_session():
         packages=packages,
         enable_filesystem=True,
     )
+    
+    # Store sub-agent config in sandbox for later use
+    sandbox.sub_agent_config = sub_agent_config
     
     if context:
         sandbox._namespace["context"] = context
@@ -128,7 +134,7 @@ def create_session():
         "session_id": session_id,
         "workspace": str(sandbox.workspace_dir),
         "available_functions": [
-            "llm_query(prompt) - Query sub-LLM (if configured)",
+            "sub_agent(task, system_prompt=None, context=None) - Invoke sub-agent for semantic analysis",
             "save_to_file(filename, content) - Save to workspace",
             "read_file(filename, lines=N) - Read from workspace",
             "list_files(pattern) - List workspace files",
@@ -168,6 +174,10 @@ def execute_in_session(session_id: str):
         "state": state_snapshot,
         "state_formatted": state_formatted,
         "execution_count": session.execution_count,
+        "sub_agent_calls": [
+            {"task": c.task, "system_prompt": c.system_prompt, "response": c.response}
+            for c in result.sub_agent_calls
+        ],
     })
 
 
@@ -218,6 +228,173 @@ def delete_session(session_id: str):
     
     session.sandbox.cleanup()
     return jsonify({"status": "deleted", "session_id": session_id})
+
+
+# ============================================================
+# LLM Query Endpoint (for sub-LLM calls from sandbox)
+# ============================================================
+
+# ============================================================
+# Sub-Agent Endpoint (for async LLM calls from sandbox)
+# ============================================================
+
+# Default sub-agent config - can be overridden per-request or per-session
+DEFAULT_SUB_MODEL = os.environ.get("SUB_LLM_MODEL", "gpt-4o-mini")
+DEFAULT_SUB_TEMPERATURE = float(os.environ.get("SUB_LLM_TEMPERATURE", "0.3"))
+DEFAULT_SUB_MAX_TOKENS = int(os.environ.get("SUB_LLM_MAX_TOKENS", "2048"))
+
+@app.route("/sub_agent", methods=["POST"])
+def sub_agent():
+    """
+    Invoke a sub-agent for semantic analysis.
+    
+    This endpoint is called by the sandbox's sub_agent() function.
+    Uses minference orchestrator for async LLM calls.
+    
+    Request body:
+        {
+            "task": "Count the dice rolls in this text...",
+            "system_prompt": "You are a helpful assistant.",  # optional
+            "context": "...",  # optional, will be wrapped in <file> tags
+            "model": "Hermes-4-405B",  # optional, from config
+            "client": "litellm",  # optional, from config
+            "max_tokens": 2048,  # optional
+            "temperature": 0.3  # optional
+        }
+    
+    Returns:
+        {"response": "The count is 84.", "model": "..."}
+    """
+    data = request.json or {}
+    task = data.get("task", "")
+    system_prompt = data.get("system_prompt", "You are a helpful assistant. Be concise and accurate.")
+    context = data.get("context")
+    
+    # Get config from request (passed from pipeline) or use defaults
+    model = data.get("model", DEFAULT_SUB_MODEL)
+    client = data.get("client", "litellm")
+    max_tokens = data.get("max_tokens", DEFAULT_SUB_MAX_TOKENS)
+    temperature = data.get("temperature", DEFAULT_SUB_TEMPERATURE)
+    
+    if not task:
+        return jsonify({"error": "No task provided"}), 400
+    
+    # Build user message with optional context in <file> tags
+    user_message = task
+    if context:
+        user_message = f"<file name=\"context\">\n{context}\n</file>\n\n{task}"
+    
+    try:
+        # Try minference orchestrator first (supports litellm, openai, anthropic)
+        try:
+            from minference.lite.inference import InferenceOrchestrator
+            from minference.lite.models import (
+                LLMConfig, LLMClient, ResponseFormat,
+                ChatThread, ChatMessage, MessageRole, SystemPrompt,
+                EntityRegistry
+            )
+            import logging
+            
+            # Initialize logger if needed
+            if not hasattr(EntityRegistry, '_logger') or EntityRegistry._logger is None:
+                EntityRegistry._logger = logging.getLogger("minference")
+            
+            # Map client string to LLMClient enum
+            client_map = {
+                "openai": LLMClient.openai,
+                "anthropic": LLMClient.anthropic,
+                "litellm": LLMClient.litellm,
+            }
+            llm_client = client_map.get(client, LLMClient.litellm)
+            
+            orchestrator = InferenceOrchestrator()
+            
+            thread = ChatThread(
+                name="sub_agent",
+                system_prompt=SystemPrompt(name="sys", content=system_prompt),
+                llm_config=LLMConfig(
+                    client=llm_client,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=ResponseFormat.text
+                ),
+                tools=[],
+                history=[],
+                new_message=user_message
+            )
+            
+            # Run synchronously (we're in Flask)
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                outputs = loop.run_until_complete(orchestrator.run_parallel_ai_completion([thread]))
+                response_text = outputs[0].content if outputs and outputs[0] else "[No response]"
+            finally:
+                loop.close()
+            
+            return jsonify({
+                "response": response_text,
+                "model": model,
+                "client": client,
+            })
+            
+        except ImportError:
+            # Fallback to openai client directly (for OpenAI-compatible endpoints)
+            from openai import OpenAI
+            
+            # Use LITELLM_ENDPOINT if set (strip /chat/completions if present)
+            api_base = os.environ.get("LITELLM_ENDPOINT", "")
+            if api_base.endswith("/chat/completions"):
+                api_base = api_base.rsplit("/chat/completions", 1)[0]
+            if not api_base.endswith("/v1"):
+                api_base = api_base.rstrip("/") + "/v1"
+            
+            api_key = os.environ.get("LITELLM_API_KEY")
+            
+            client = OpenAI(api_key=api_key, base_url=api_base)
+            
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            
+            return jsonify({
+                "response": response.choices[0].message.content,
+                "model": model,
+            })
+            
+    except Exception as e:
+        import traceback
+        print(f"Sub-agent error: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "error": str(e),
+            "response": f"[Sub-agent call failed: {str(e)}]"
+        }), 500
+
+
+# Legacy endpoint alias
+@app.route("/llm_query", methods=["POST"])
+def llm_query_legacy():
+    """Legacy endpoint - redirects to sub_agent."""
+    data = request.json or {}
+    # Map old format to new format
+    new_data = {
+        "task": data.get("prompt", ""),
+        "system_prompt": data.get("system_prompt"),
+        "max_tokens": data.get("max_tokens"),
+        "temperature": data.get("temperature"),
+    }
+    # Forward to sub_agent
+    with app.test_request_context(json=new_data):
+        return sub_agent()
 
 
 # ============================================================

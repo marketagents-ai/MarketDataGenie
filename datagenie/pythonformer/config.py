@@ -144,6 +144,16 @@ class PythonformerConfig:
         if 'debug' in data:
             config.debug = data['debug']
         
+        # Sub-LLM settings (shorthand in YAML)
+        if 'sub_model' in data:
+            config.sub_llm.model = data['sub_model']
+        if 'sub_client' in data:
+            config.sub_llm.client = LLMClientType(data['sub_client'])
+        if 'sub_temperature' in data:
+            config.sub_llm.temperature = data['sub_temperature']
+        if 'sub_max_tokens' in data:
+            config.sub_llm.max_tokens = data['sub_max_tokens']
+        
         return config
     
     def get_llm_client(self) -> 'LLMClient':
