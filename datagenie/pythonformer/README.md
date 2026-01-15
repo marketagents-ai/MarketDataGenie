@@ -2,6 +2,36 @@
 
 A pipeline for generating interleaved reasoning + Python code training data using a REPL server. Designed for training models that solve problems through code execution with step-by-step reasoning.
 
+## Supported Environments
+
+Pythonformer supports multiple task types, each with specialized prompts and context management:
+
+| Environment | Description | Context Format | Use Case |
+|-------------|-------------|----------------|----------|
+| **base** | General problem-solving | Single context or none | Math, algorithms, data analysis |
+| **oolong** | Long-context analysis | Single large file (150K+ chars) | Document analysis, counting, aggregation |
+| **hotpotqa** | Multi-hop reasoning | Multiple document files | Cross-document reasoning, fact verification |
+
+### Environment Details
+
+#### 1. Base Environment
+- **Config**: `configs/default_config.yaml`
+- **Context**: Optional, passed as variable or small file
+- **Strategy**: Direct problem solving with code
+- **Example**: Solve equations, implement algorithms, analyze data
+
+#### 2. OOLONG Environment  
+- **Config**: `configs/oolong_config.yaml`
+- **Context**: Single `context.txt` file (150K+ characters)
+- **Strategy**: Chunked processing + sub-agent for semantic analysis
+- **Example**: Count occurrences in D&D transcripts, aggregate statistics
+
+#### 3. HotpotQA Environment
+- **Config**: `configs/hotpotqa_config.yaml`
+- **Context**: Multiple files (`doc_01_Title.txt`, `doc_02_Title.txt`, ...)
+- **Strategy**: Document discovery + multi-hop reasoning
+- **Example**: "Which magazine was started first?", "What is the director's nationality?"
+
 ## Pipeline Workflow
 
 ```mermaid
@@ -168,14 +198,22 @@ python -m datagenie.pythonformer.python_server.server --port 5003
 ### 2. Run the Pipeline
 
 ```bash
-# Basic usage (math problems)
-python -m datagenie.pythonformer.run --config datagenie/pythonformer/configs/default_config.yaml --limit 10
+# Base environment (math problems)
+python -m datagenie.pythonformer.run \
+    --config datagenie/pythonformer/configs/default_config.yaml \
+    --limit 10
 
-# Long-context tasks (OOLONG)
-python -m datagenie.pythonformer.run --config datagenie/pythonformer/configs/oolong_config.yaml --limit 4
+# OOLONG environment (long-context)
+python -m datagenie.pythonformer.run \
+    --config datagenie/pythonformer/configs/oolong_config.yaml \
+    --limit 4 \
+    --debug
 
-# With debug output (colored pretty printing)
-python -m datagenie.pythonformer.run --config datagenie/pythonformer/configs/oolong_config.yaml --limit 2 --debug
+# HotpotQA environment (multi-hop reasoning)
+python -m datagenie.pythonformer.run \
+    --config datagenie/pythonformer/configs/hotpotqa_config.yaml \
+    --limit 4 \
+    --debug
 ```
 
 ## Configuration
@@ -296,6 +334,18 @@ datagenie/pythonformer/
 ├── pipeline.py                  # Main PythonformerPipeline class
 ├── repl_client.py               # HTTP client for REPL server
 ├── run.py                       # CLI entry point
+├── prompts/                     # Task-specific system prompts
+│   ├── __init__.py
+│   ├── base.py                  # General problem-solving
+│   ├── oolong.py                # Long-context analysis
+│   ├── hotpotqa.py              # Multi-hop reasoning
+│   └── README.md
+├── reward_functions/            # Pluggable reward system
+│   ├── __init__.py
+│   ├── functions.py             # Reward function definitions
+│   ├── compute_rewards.py       # Standalone reward computation
+│   ├── README.md
+│   └── IMPLEMENTATION.md
 ├── python_server/               # REPL server (Docker)
 │   ├── __init__.py
 │   ├── sandbox.py               # PythonSandbox with state tracking
@@ -307,8 +357,9 @@ datagenie/pythonformer/
 │   ├── __init__.py
 │   └── debug.py                 # Colored pretty printing
 └── configs/
-    ├── default_config.yaml      # Math problem solving
-    └── oolong_config.yaml       # Long-context analysis
+    ├── default_config.yaml      # Base environment
+    ├── oolong_config.yaml       # OOLONG environment
+    └── hotpotqa_config.yaml     # HotpotQA environment
 ```
 
 ## REPL Server API
@@ -454,6 +505,167 @@ If sympy/numpy/etc. not found, the server is running outside Docker without pack
 
 Fixed in latest version - each task now creates its own `REPLClient` instance for session isolation.
 
+## Reward System
+
+The pipeline includes a pluggable reward system for trajectory evaluation and filtering.
+
+### Configuration
+
+```yaml
+dataset:
+  enable_rewards: false  # Toggle: set to true to enable
+  reward_function: "simple"  # Options: "simple", "efficiency", "normalized"
+```
+
+### Available Reward Functions
+
+1. **simple**: Binary reward (+1 correct, -0.5 incorrect)
+2. **efficiency**: Considers correctness, efficiency, and code quality
+3. **normalized**: Normalized by trajectory length
+
+### Standalone Reward Computation
+
+Compute rewards on existing trajectories:
+
+```bash
+# Analyze rewards
+python -m datagenie.pythonformer.reward_functions.compute_rewards \
+    --input outputs/pythonformer_hotpotqa/traces_*.jsonl \
+    --reward-function efficiency \
+    --analyze-only
+
+# Filter high-quality trajectories
+python -m datagenie.pythonformer.reward_functions.compute_rewards \
+    --input outputs/traces.jsonl \
+    --reward-function simple \
+    --min-reward 0.9 \
+    --output outputs/high_quality.jsonl
+```
+
+See `reward_functions/README.md` for details on creating custom reward functions.
+
+## RLM-Compatible Features
+
+The sandbox now supports [Recursive Language Models (RLM)](https://arxiv.org/abs/2512.24601) paradigm features for RL training.
+
+### Finalization Patterns
+
+Multiple ways to signal task completion:
+
+```python
+# Pattern 1: Direct FINAL() call (recommended)
+result = 42
+FINAL(result)  # -> done=True, final_answer="42"
+
+# Pattern 2: FINAL() via print (regex detected)
+print(f'FINAL({result})')  # -> done=True, final_answer="42"
+
+# Pattern 3: FINAL_VAR() for variable lookup
+my_answer = "The count is 42"
+FINAL_VAR("my_answer")  # -> done=True, final_answer="The count is 42"
+
+# Pattern 4: Prime Intellect style answer dict
+answer["content"] = "42"
+answer["ready"] = True  # -> done=True, final_answer="42"
+```
+
+### Execution Result Fields
+
+```python
+@dataclass
+class ExecutionResult:
+    success: bool           # Code executed without error
+    output: str             # stdout/stderr output
+    error: Optional[str]    # Error message if failed
+    truncated: bool         # Output was truncated
+    execution_time_ms: int  # Execution time
+    
+    # State tracking
+    answer: Dict[str, Any]  # answer variable state
+    files_created: List[str]
+    variables: Dict[str, str]
+    state_formatted: str    # "imports: np | vars: x=42"
+    sub_agent_calls: List[SubAgentCall]
+    
+    # RLM-style fields
+    done: bool              # Episode complete
+    final_answer: str       # Extracted final answer
+    iteration: int          # Current iteration (1-indexed)
+    reward: float           # Step reward for RL
+```
+
+### Reward Configuration
+
+Configure rewards for RL training:
+
+```python
+from datagenie.pythonformer.repl_client import REPLClient
+
+client = REPLClient()
+client.create_session(
+    max_iterations=30,
+    reward_config={
+        "on_success": 1.0,    # When FINAL() called
+        "on_iteration": 0.0,  # Per step (can be negative)
+        "on_error": -0.05,    # Code execution error
+        "on_failure": -0.1,   # Max iterations reached
+    }
+)
+```
+
+### Episode State
+
+Get full episode state for RL training:
+
+```json
+{
+  "iteration": 5,
+  "max_iterations": 30,
+  "done": false,
+  "final_answer": null,
+  "context_length": 152445,
+  "context_preview": "The following lines contains...",
+  "available_variables": ["context", "lines", "count"]
+}
+```
+
+### RL Training Integration
+
+```python
+from datagenie.pythonformer.repl_client import REPLClient
+
+def collect_trajectory(client, context, task):
+    """Collect a trajectory for RL training."""
+    client.create_session(
+        context=context,
+        max_iterations=30,
+        reward_config={"on_success": 1.0, "on_error": -0.05}
+    )
+    
+    trajectory = []
+    result = None
+    
+    while True:
+        # Get code from policy
+        code = policy.generate(result)
+        
+        # Execute and get reward
+        result = client.execute(code)
+        
+        trajectory.append({
+            "code": code,
+            "output": result.output,
+            "reward": result.reward,
+            "done": result.done,
+            "iteration": result.iteration,
+        })
+        
+        if result.done:
+            break
+    
+    return trajectory, result.final_answer
+```
+
 ## Long-Context Pipeline (OOLONG)
 
 The OOLONG environment is designed for long-context document analysis tasks where the context is too large to process in a single LLM pass.
@@ -577,3 +789,140 @@ The total number of rolls in this episode is \boxed{84}.
 
 ✅ Answer correct: 84 == 84
 ```
+
+## Multi-Hop Reasoning Pipeline (HotpotQA)
+
+The HotpotQA environment is designed for multi-hop reasoning tasks that require information from multiple documents.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    subgraph Input["📥 Multi-Document Input"]
+        A[HotpotQA Dataset<br/><i>10 documents per task</i>]
+        A --> B[Create Separate Files<br/><i>doc_01_Title.txt, doc_02_Title.txt, ...</i>]
+    end
+
+    subgraph Discovery["🔍 Document Discovery"]
+        B --> C[list_files<br/><i>doc_*.txt</i>]
+        C --> D[search_files<br/><i>find relevant docs</i>]
+        D --> E[Select Documents<br/><i>2-3 relevant from 10</i>]
+    end
+
+    subgraph Hop1["🎯 First Hop"]
+        E --> F[Read Document 1]
+        F --> G[Extract Entity/Fact<br/><i>via sub_agent</i>]
+    end
+
+    subgraph Hop2["🎯 Second Hop"]
+        G --> H[Find Related Document]
+        H --> I[Read Document 2]
+        I --> J[Extract Answer<br/><i>via sub_agent</i>]
+    end
+
+    subgraph Output["📊 Final Answer"]
+        J --> K[Compare/Combine]
+        K --> L[\\boxed Answer]
+    end
+
+    style C fill:#e1f5fe
+    style G fill:#fff3e0
+    style J fill:#e8f5e9
+    style L fill:#e8f5e9
+```
+
+### Multi-File Architecture
+
+Each document is saved as a separate file for natural document hopping:
+
+```
+workspace/
+├── doc_01_Arthurs_Magazine.txt
+├── doc_02_First_for_Women.txt
+├── doc_03_Radio_City.txt
+├── doc_04_History_of_Albanian_football.txt
+...
+```
+
+### Multi-Hop Example
+
+```python
+# Step 1: List available documents
+docs = list_files("doc_*.txt")
+print(f"Found {len(docs)} documents")
+
+# Step 2: Find documents about both entities
+laleli_files = [d for d in docs if 'Laleli_Mosque' in d]
+esma_files = [d for d in docs if 'Esma_Sultan_Mansion' in d]
+
+# Step 3: HOP 1 - Extract neighborhood from first document
+laleli_text = read_file(laleli_files[0])
+laleli_neighborhood = sub_agent(
+    task=f"What neighborhood is the Laleli Mosque located in?\\n\\n{laleli_text}",
+    system_prompt="Extract the neighborhood name. Return only the name."
+)
+
+# Step 4: HOP 2 - Extract neighborhood from second document
+esma_text = read_file(esma_files[0])
+esma_neighborhood = sub_agent(
+    task=f"What neighborhood is the Esma Sultan Mansion located in?\\n\\n{esma_text}",
+    system_prompt="Extract the neighborhood name. Return only the name."
+)
+
+# Step 5: Compare
+if laleli_neighborhood.lower() == esma_neighborhood.lower():
+    result = "Yes"
+else:
+    result = "No"
+```
+
+### HotpotQA Dataset
+
+The pipeline supports the [HotpotQA dataset](https://huggingface.co/datasets/hotpotqa/hotpot_qa) for multi-hop reasoning:
+
+- **Distractor config**: 10 documents (2 relevant + 8 distractors)
+- **Fullwiki config**: Full Wikipedia retrieval (harder)
+- **Question types**: Comparison, bridge (multi-hop)
+- **Expected answers**: Short factual answers
+
+### Example Output
+
+```
+============================================================
+Task: 5adbf0a255429947ff17385a
+============================================================
+Prompt: Are the Laleli Mosque and Esma Sultan Mansion located in the same neighborhood?
+Expected: no
+
+▶ Executing Code Block #1
+<python>
+docs = list_files("doc_*.txt")
+laleli_files = [d for d in docs if 'Laleli_Mosque' in d]
+esma_files = [d for d in docs if 'Esma_Sultan_Mansion' in d]
+# ... multi-hop extraction ...
+</python>
+
+<sub_agent> task: What neighborhood is the Laleli Mosque located in?
+response: Laleli
+<sub_agent> task: What neighborhood is the Esma Sultan Mansion located in?
+response: Ortaköy
+
+<final_answer>
+No, the Laleli Mosque and Esma Sultan Mansion are not located in the same 
+neighborhood. The Laleli Mosque is in the Laleli neighborhood, while the 
+Esma Sultan Mansion is in the Ortaköy neighborhood.
+</final_answer>
+
+✅ Answer correct: No == no
+```
+
+### Comparison: OOLONG vs HotpotQA
+
+| Aspect | OOLONG | HotpotQA |
+|--------|--------|----------|
+| Context Size | 150K+ chars | 5-10K chars |
+| Files | 1 large file | 10 small files |
+| Task Type | Counting/aggregation | Multi-hop reasoning |
+| Strategy | Chunking + map-reduce | Document hopping |
+| Sub-agent Use | Chunk analysis | Entity extraction |
+| Complexity | Pattern matching | Cross-document reasoning |

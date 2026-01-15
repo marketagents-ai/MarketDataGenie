@@ -45,6 +45,11 @@ class ExecutionResult:
     files_created: List[str] = field(default_factory=list)
     files_modified: List[str] = field(default_factory=list)
     sub_agent_calls: List[SubAgentCall] = field(default_factory=list)
+    # RLM-style fields
+    done: bool = False  # Episode complete (FINAL called or answer ready)
+    final_answer: Optional[str] = None  # Extracted final answer
+    iteration: int = 0  # Current iteration count
+    reward: float = 0.0  # Step reward for RL training
 
 
 class PythonSandbox:
@@ -55,8 +60,16 @@ class PythonSandbox:
     - Persistent state across multiple executions
     - Workspace filesystem for dynamic context management
     - Pre-injected `answer` variable: {"content": "", "ready": False}
-    - Pre-injected `llm_query()` function for sub-LLM calls
+    - Pre-injected `FINAL()` and `FINAL_VAR()` helper functions (RLM-style)
+    - Pre-injected `sub_agent()` function for sub-LLM calls
     - Output truncation to prevent context explosion
+    - Iteration tracking and reward signals for RL training
+    
+    Finalization Patterns (RLM-compatible):
+    1. FINAL(answer) - Direct call with value
+    2. print('FINAL(answer)') - Print pattern (regex detected)
+    3. FINAL_VAR("var_name") - Variable lookup
+    4. answer = {"content": "...", "ready": True} - Prime Intellect style
     
     Filesystem Design (inspired by Cursor's dynamic context discovery):
     - Long outputs are written to files instead of bloating context
@@ -73,12 +86,34 @@ class PythonSandbox:
         packages: Optional[List[str]] = None,
         workspace_dir: Optional[str] = None,
         enable_filesystem: bool = True,
+        # RL reward configuration
+        reward_on_success: float = 1.0,
+        reward_on_iteration: float = 0.0,
+        reward_on_error: float = -0.05,
+        reward_on_failure: float = -0.1,
+        # Context preview
+        context_preview_length: int = 500,
     ):
         self.max_output_chars = max_output_chars
         self.max_output_lines = max_output_lines
         self.timeout_seconds = timeout_seconds
         self.llm_batch_callback = llm_batch_callback
         self.enable_filesystem = enable_filesystem
+        
+        # RL reward configuration
+        self.reward_on_success = reward_on_success
+        self.reward_on_iteration = reward_on_iteration
+        self.reward_on_error = reward_on_error
+        self.reward_on_failure = reward_on_failure
+        
+        # Context preview
+        self.context_preview_length = context_preview_length
+        
+        # Episode state
+        self._iteration = 0
+        self._max_iterations = 30  # Default, can be set via reset()
+        self._done = False
+        self._final_answer: Optional[str] = None
         
         # Setup workspace directory
         if workspace_dir:
@@ -155,20 +190,58 @@ class PythonSandbox:
         
         self._namespace['__builtins__'] = safe_builtins
         self._namespace['answer'] = {"content": "", "ready": False}
+        
+        # RLM-style finalization helpers
+        self._namespace['FINAL'] = self._final_helper
+        self._namespace['FINAL_VAR'] = self._final_var_helper
+        
         # Sub-agent for additional analysis (async LLM calls)
         self._namespace['sub_agent'] = self._sub_agent_wrapper
         self._namespace['sub_agent_batch'] = self._sub_agent_batch_wrapper
         # Legacy alias
         self._namespace['llm_query'] = self._sub_agent_wrapper
+        self._namespace['llm_query_batched'] = self._sub_agent_batch_wrapper
         
         if self.enable_filesystem:
             self._namespace['workspace'] = str(self.workspace_dir)
+            # File operations (auto-detect type for json/csv)
             self._namespace['save_to_file'] = self._save_to_file
             self._namespace['read_file'] = self._read_file
             self._namespace['list_files'] = self._list_files
             self._namespace['file_exists'] = self._file_exists
+            # Enhanced operations
+            self._namespace['get_file_info'] = self._get_file_info
+            self._namespace['search_files'] = self._search_files
+            # Scratch vs output organization
+            self._namespace['save_scratch'] = self._save_scratch
+            self._namespace['save_output'] = self._save_output
+            self._namespace['list_scratch'] = self._list_scratch
+            self._namespace['list_output'] = self._list_output
         
         self._import_packages(packages)
+    
+    def _final_helper(self, value: Any) -> str:
+        """
+        FINAL(answer) - RLM-style finalization helper.
+        
+        Marks the episode as done and sets the final answer.
+        Returns a string representation for print detection.
+        """
+        self._done = True
+        self._final_answer = str(value)
+        self._namespace['answer'] = {"content": str(value), "ready": True}
+        return f"FINAL({value})"
+    
+    def _final_var_helper(self, var_name: str) -> str:
+        """
+        FINAL_VAR("var_name") - RLM-style variable lookup finalization.
+        
+        Looks up the variable by name and calls FINAL with its value.
+        """
+        if var_name not in self._namespace:
+            raise NameError(f"Variable '{var_name}' not found in namespace")
+        value = self._namespace[var_name]
+        return self._final_helper(value)
     
     def _sandboxed_open(self, path, mode='r', *args, **kwargs):
         """Sandboxed open() that restricts to workspace directory."""
@@ -186,24 +259,97 @@ class PythonSandbox:
         
         return open(path, mode, *args, **kwargs)
     
-    def _save_to_file(self, filename: str, content: str) -> str:
-        """Save content to a file in the workspace."""
+    def _save_to_file(self, filename: str, content: Any) -> str:
+        """
+        Save content to a file in the workspace.
+        
+        Auto-detects how to serialize based on file extension:
+        - .json -> JSON serializes dict/list
+        - .csv -> saves DataFrame as CSV
+        - others -> saves as string
+        
+        Args:
+            filename: Target filename
+            content: Content to save (str, dict, list, or DataFrame)
+            
+        Returns:
+            Full path to saved file
+        """
         filepath = self.workspace_dir / filename
         filepath.parent.mkdir(parents=True, exist_ok=True)
-        filepath.write_text(content)
+        
+        ext = filepath.suffix.lower()
+        
+        if ext == '.json':
+            import json
+            if isinstance(content, str):
+                filepath.write_text(content)
+            else:
+                filepath.write_text(json.dumps(content, indent=2, ensure_ascii=False))
+        
+        elif ext == '.csv':
+            # Check if it's a DataFrame
+            if hasattr(content, 'to_csv'):
+                content.to_csv(filepath, index=False)
+            else:
+                filepath.write_text(str(content))
+        
+        else:
+            filepath.write_text(str(content))
+        
         return str(filepath)
     
-    def _read_file(self, filename: str, lines: Optional[int] = None) -> str:
-        """Read content from a file in the workspace."""
+    def _read_file(self, filename: str, lines: Optional[int] = None, raw: bool = False) -> Any:
+        """
+        Read content from a file in the workspace.
+        
+        Auto-detects file type and parses accordingly:
+        - .json -> returns dict/list
+        - .csv -> returns pandas DataFrame
+        - .txt, .md, etc -> returns string
+        
+        Args:
+            filename: File to read
+            lines: Optional, return only last N lines (text files only)
+            raw: If True, always return raw text regardless of extension
+            
+        Returns:
+            Parsed content based on file type, or raw string if raw=True
+        """
         filepath = self.workspace_dir / filename
         if not filepath.exists():
             raise FileNotFoundError(f"File not found: {filename}")
         
-        content = filepath.read_text()
-        if lines:
-            content_lines = content.split('\n')
-            content = '\n'.join(content_lines[-lines:])
-        return content
+        ext = filepath.suffix.lower()
+        
+        # Return raw text if requested or for line-limited reads
+        if raw or lines is not None:
+            content = filepath.read_text()
+            if lines:
+                content_lines = content.split('\n')
+                content = '\n'.join(content_lines[-lines:])
+            return content
+        
+        # Auto-detect and parse based on extension
+        if ext == '.json':
+            import json
+            return json.loads(filepath.read_text())
+        
+        elif ext == '.csv':
+            pd = self._namespace.get('pd')
+            if pd is None:
+                import pandas as pd
+            return pd.read_csv(filepath)
+        
+        elif ext == '.tsv':
+            pd = self._namespace.get('pd')
+            if pd is None:
+                import pandas as pd
+            return pd.read_csv(filepath, sep='\t')
+        
+        else:
+            # Default: return as text
+            return filepath.read_text()
     
     def _list_files(self, pattern: str = "*") -> List[str]:
         """List files in workspace matching pattern."""
@@ -216,6 +362,122 @@ class PythonSandbox:
     def _file_exists(self, filename: str) -> bool:
         """Check if file exists in workspace."""
         return (self.workspace_dir / filename).exists()
+    
+    # ============================================================
+    # Enhanced Filesystem Operations
+    # ============================================================
+    
+    def _get_file_info(self, filename: str) -> Dict[str, Any]:
+        """
+        Get metadata about a file.
+        
+        Returns:
+            Dict with size, lines, type, modified time
+        """
+        filepath = self.workspace_dir / filename
+        if not filepath.exists():
+            raise FileNotFoundError(f"File not found: {filename}")
+        
+        stat = filepath.stat()
+        content = filepath.read_text()
+        lines = content.count('\n') + 1 if content else 0
+        
+        # Detect file type from extension
+        ext = filepath.suffix.lower()
+        file_type = {
+            '.txt': 'text', '.md': 'markdown',
+            '.json': 'json', '.csv': 'csv', '.tsv': 'tsv',
+            '.py': 'python', '.js': 'javascript',
+            '.yaml': 'yaml', '.yml': 'yaml',
+            '.xml': 'xml', '.html': 'html',
+        }.get(ext, 'text')
+        
+        return {
+            "name": filename,
+            "size": stat.st_size,
+            "lines": lines,
+            "type": file_type,
+            "chars": len(content),
+        }
+    
+    def _search_files(
+        self, 
+        query: str, 
+        pattern: str = "*",
+        max_results: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for content across files in workspace.
+        
+        Args:
+            query: Regex pattern to search for
+            pattern: Glob pattern for files to search (default: all)
+            max_results: Maximum number of matches to return
+            
+        Returns:
+            List of matches with file, line number, and context
+        """
+        import re
+        results = []
+        
+        try:
+            regex = re.compile(query, re.IGNORECASE)
+        except re.error as e:
+            raise ValueError(f"Invalid regex pattern: {e}")
+        
+        for filepath in self.workspace_dir.rglob(pattern):
+            if not filepath.is_file():
+                continue
+            
+            try:
+                content = filepath.read_text()
+                for i, line in enumerate(content.split('\n'), 1):
+                    if regex.search(line):
+                        results.append({
+                            "file": str(filepath.relative_to(self.workspace_dir)),
+                            "line": i,
+                            "match": line[:200] + "..." if len(line) > 200 else line
+                        })
+                        if len(results) >= max_results:
+                            return results
+            except (UnicodeDecodeError, PermissionError):
+                continue
+        
+        return results
+    
+    # ============================================================
+    # Scratch vs Output File Management
+    # ============================================================
+    
+    def _save_scratch(self, filename: str, content: Any) -> str:
+        """
+        Save temporary/intermediate content to scratch directory.
+        Scratch files are for reasoning steps, not final outputs.
+        """
+        scratch_path = Path("scratch") / filename
+        return self._save_to_file(str(scratch_path), content)
+    
+    def _save_output(self, filename: str, content: Any) -> str:
+        """
+        Save final output/artifact to output directory.
+        Output files are important results to preserve.
+        """
+        output_path = Path("output") / filename
+        return self._save_to_file(str(output_path), content)
+    
+    def _list_scratch(self) -> List[str]:
+        """List files in scratch directory."""
+        scratch_dir = self.workspace_dir / "scratch"
+        if not scratch_dir.exists():
+            return []
+        return [str(f.relative_to(scratch_dir)) for f in scratch_dir.rglob("*") if f.is_file()]
+    
+    def _list_output(self) -> List[str]:
+        """List files in output directory."""
+        output_dir = self.workspace_dir / "output"
+        if not output_dir.exists():
+            return []
+        return [str(f.relative_to(output_dir)) for f in output_dir.rglob("*") if f.is_file()]
     
     def _import_packages(self, packages: List[str]) -> None:
         """Import pre-approved packages into namespace."""
@@ -330,7 +592,11 @@ class PythonSandbox:
     def execute(self, code: str) -> ExecutionResult:
         """Execute Python code in the sandbox."""
         import time
+        import re
         start_time = time.time()
+        
+        # Increment iteration counter
+        self._iteration += 1
         
         # Clear sub-agent calls from previous execution
         self._sub_agent_calls = []
@@ -340,7 +606,8 @@ class PythonSandbox:
         
         result = ExecutionResult(
             success=False, output="",
-            answer_state=self._namespace.get('answer', {}).copy()
+            answer_state=self._namespace.get('answer', {}).copy(),
+            iteration=self._iteration,
         )
         
         original_cwd = os.getcwd()
@@ -387,6 +654,58 @@ class PythonSandbox:
         # Include sub-agent calls made during this execution
         result.sub_agent_calls = self._sub_agent_calls.copy()
         
+        # ============================================================
+        # RLM-style finalization detection
+        # ============================================================
+        
+        # Check if FINAL() was called directly (sets self._done)
+        if self._done:
+            result.done = True
+            result.final_answer = self._final_answer
+        
+        # Check for print('FINAL(...)') pattern in output
+        elif not result.done:
+            final_match = re.search(r'FINAL\(([^)]+)\)', stdout_output)
+            if final_match:
+                result.done = True
+                result.final_answer = final_match.group(1).strip()
+                self._done = True
+                self._final_answer = result.final_answer
+        
+        # Check for print('FINAL_VAR(var_name)') pattern
+        if not result.done:
+            final_var_match = re.search(r'FINAL_VAR\(([^)]+)\)', stdout_output)
+            if final_var_match:
+                var_name = final_var_match.group(1).strip().strip('"\'')
+                if var_name in self._namespace:
+                    result.done = True
+                    result.final_answer = str(self._namespace[var_name])
+                    self._done = True
+                    self._final_answer = result.final_answer
+        
+        # Check for answer["ready"] = True (Prime Intellect style)
+        if not result.done and result.answer_state.get("ready", False):
+            result.done = True
+            result.final_answer = str(result.answer_state.get("content", ""))
+            self._done = True
+            self._final_answer = result.final_answer
+        
+        # Check for max iterations
+        if not result.done and self._iteration >= self._max_iterations:
+            result.done = True
+            result.reward = self.reward_on_failure
+        
+        # ============================================================
+        # Reward calculation
+        # ============================================================
+        
+        if result.done and result.final_answer is not None:
+            result.reward = self.reward_on_success
+        elif result.error:
+            result.reward = self.reward_on_error
+        else:
+            result.reward = self.reward_on_iteration
+        
         self.history.append((code, result))
         return result
     
@@ -399,11 +718,17 @@ class PythonSandbox:
         answer = self._namespace.get('answer', {})
         return answer.get('ready', False)
     
-    def reset(self) -> None:
+    def reset(self, max_iterations: int = 30) -> None:
         """Reset the sandbox to initial state."""
         self._namespace.clear()
         self._init_namespace([])
         self.history.clear()
+        
+        # Reset episode state
+        self._iteration = 0
+        self._max_iterations = max_iterations
+        self._done = False
+        self._final_answer = None
         
         if self._owns_workspace and self.workspace_dir.exists():
             for f in self.workspace_dir.iterdir():
@@ -417,11 +742,55 @@ class PythonSandbox:
         if self._owns_workspace and self.workspace_dir.exists():
             shutil.rmtree(self.workspace_dir)
     
+    def get_context_preview(self) -> Optional[str]:
+        """Get a preview of the context variable (first N chars)."""
+        context = self._namespace.get('context')
+        if context is None:
+            return None
+        return str(context)[:self.context_preview_length]
+    
+    def get_context_length(self) -> int:
+        """Get the total length of the context variable."""
+        context = self._namespace.get('context')
+        if context is None:
+            return 0
+        return len(str(context))
+    
+    def get_episode_state(self) -> Dict[str, Any]:
+        """Get current episode state for RL training."""
+        return {
+            "iteration": self._iteration,
+            "max_iterations": self._max_iterations,
+            "done": self._done,
+            "final_answer": self._final_answer,
+            "context_length": self.get_context_length(),
+            "context_preview": self.get_context_preview(),
+            "available_variables": list(self.get_namespace_summary().keys()),
+        }
+    
+    @property
+    def done(self) -> bool:
+        """Check if episode is complete."""
+        return self._done
+    
+    @property
+    def final_answer(self) -> Optional[str]:
+        """Get the final answer if episode is complete."""
+        return self._final_answer
+    
+    @property
+    def iteration(self) -> int:
+        """Get current iteration count."""
+        return self._iteration
+    
     def get_namespace_summary(self) -> Dict[str, str]:
         """Get a summary of variables in the namespace."""
         summary = {}
-        skip_keys = {'__builtins__', 'sub_agent', 'sub_agent_batch', 'llm_query',
-                     'save_to_file', 'read_file', 'list_files', 'file_exists', 'workspace'}
+        skip_keys = {'__builtins__', 'sub_agent', 'sub_agent_batch', 'llm_query', 'llm_query_batched',
+                     'save_to_file', 'read_file', 'list_files', 'file_exists', 'workspace',
+                     'get_file_info', 'search_files',
+                     'save_scratch', 'save_output', 'list_scratch', 'list_output',
+                     'FINAL', 'FINAL_VAR'}
         
         for key, value in self._namespace.items():
             if key in skip_keys:
@@ -443,8 +812,11 @@ class PythonSandbox:
         import inspect
         import types
         
-        skip_keys = {'__builtins__', 'sub_agent', 'sub_agent_batch', 'llm_query',
-                     'save_to_file', 'read_file', 'list_files', 'file_exists', 'workspace', 'context'}
+        skip_keys = {'__builtins__', 'sub_agent', 'sub_agent_batch', 'llm_query', 'llm_query_batched',
+                     'save_to_file', 'read_file', 'list_files', 'file_exists', 'workspace', 'context',
+                     'get_file_info', 'search_files',
+                     'save_scratch', 'save_output', 'list_scratch', 'list_output',
+                     'FINAL', 'FINAL_VAR'}
         
         variables, functions, classes, modules = {}, {}, {}, []
         
@@ -519,6 +891,14 @@ class PythonSandbox:
             files = self._list_files("*")
             if files:
                 parts.append(f"files: {', '.join(files)}")
+        
+        # Add episode completion status (signals model to output <final_answer>)
+        if self._done:
+            parts.append(f"done: True")
+            if self._final_answer is not None:
+                # Truncate long answers in state display
+                answer_preview = self._final_answer[:50] + "..." if len(self._final_answer) > 50 else self._final_answer
+                parts.append(f"final_answer: {answer_preview}")
         
         return " | ".join(parts) if parts else "(empty state)"
 

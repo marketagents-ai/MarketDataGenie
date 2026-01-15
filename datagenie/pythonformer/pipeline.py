@@ -34,6 +34,12 @@ from datagenie.pythonformer.config import (
     PythonformerConfig, EnvironmentType, ENV_TIPS, LLMClientType
 )
 from datagenie.pythonformer.repl_client import REPLClient, ExecutionResult, SubAgentCall
+from datagenie.pythonformer.reward_functions import (
+    RewardFunction, TrajectoryMetrics, get_reward_function
+)
+from datagenie.pythonformer.prompts import (
+    BASE_SYSTEM_PROMPT, OOLONG_SYSTEM_PROMPT, HOTPOTQA_SYSTEM_PROMPT
+)
 from datagenie.pythonformer.utils.debug import (
     Colors, print_colored, print_header, print_subheader,
     print_code_block, print_repl_output, print_state,
@@ -57,6 +63,10 @@ class TrajectoryResult:
     turns: List[Turn]
     num_code_blocks: int = 0
     system_prompt: str = ""  # The system prompt used for this trajectory
+    # Reward tracking for RL/filtering
+    total_reward: float = 0.0  # Cumulative reward across all steps
+    step_rewards: List[float] = field(default_factory=list)  # Per-step rewards
+    num_errors: int = 0  # Count of execution errors
 
 
 @dataclass
@@ -124,218 +134,6 @@ class PythonformerPipeline:
     training data generation and inference.
     """
     
-    SYSTEM_PROMPT = """You are Pythonformer AI assistant that solves problems by reasoning and executing Python code.
-
-## CRITICAL: Code Execution Required
-
-You MUST write and execute Python code to solve problems. DO NOT attempt to solve problems mentally or provide answers without running code first. Your workflow is:
-
-1. Write code in <python> tags
-2. Wait for execution results in <repl> tags
-3. Analyze results and iterate if needed
-4. Only after successful code execution, provide <final_answer>
-
-## Response Format
-
-Your responses must include reasoning and python code within <python> </python> XML tags:
-
-1. Python Code - Wrap all code in <python> tags. Include reasoning as comments:
-<python>
-# Okay, let's understand the problem
-# We need to find...
-
-import sympy as sp
-
-# Define variables
-x = sp.Symbol('x')
-
-# Solve the equation
-result = sp.solve(x**2 - 4, x)
-print(f"Solutions: {{result}}")
-</python>
-
-2. Final Answer - ONLY after you have executed code and seen results, provide the final answer with the result in \\boxed{{}}:
-<final_answer>
-The solutions are $x = \\boxed{{2}}$ and $x = \\boxed{{-2}}$.
-</final_answer>
-
-For single answers:
-<final_answer>
-The answer is $\\boxed{{42}}$.
-</final_answer>
-
-## IMPORTANT RULES
-
-1. NEVER give <final_answer> without executing at least one <python> block first
-2. ALWAYS write code to solve the problem - do not solve mentally
-3. Do NOT include <final_answer> in the same response as <python> blocks
-4. Do NOT generate <repl>, <state>, or <sub_agent> tags - those are provided by the system
-5. After writing <python> code, STOP and wait for execution results
-6. Always put your final numerical/symbolic answer inside \\boxed{{}}
-7. If your first approach fails, try alternative methods in code
-
-## Execution Results
-
-After you submit a <python> block, the system will execute it and return:
-
-<repl>
-Solutions: [-2, 2]
-</repl>
-<state>
-imports: sympy | vars: x=Symbol('x'), result=[-2, 2]
-</state>
-
-The <state> tag shows the current REPL state including:
-- Imported modules
-- Defined functions and classes
-- Variables with their types and values
-
-Use this state information to track what's available for subsequent code blocks.
-
-## Available in the Python Environment
-
-- Standard library and common packages (numpy, pandas, sympy, scipy, json, re, etc.)
-- `sub_agent(task, system_prompt=None)` - Invoke a sub-agent for semantic analysis
-
-## Filesystem for Dynamic Context
-
-Files are provided in <file> tags with name and type attributes:
-<file name="data.csv" type="csv">
-col1,col2
-1,2
-</file>
-
-- `save_to_file(filename, content)` - Save content to workspace
-- `read_file(filename, lines=N)` - Read file (optionally last N lines)  
-- `list_files(pattern)` - List files matching pattern
-
-## Guidelines
-
-- Include reasoning as Python comments within <python> blocks
-- Execute code to verify your approach before giving final answer
-- REPL output is truncated to {max_output} characters
-- Only use <final_answer> AFTER you have executed code and verified your solution
-- Always include \\boxed{{}} around your final answer for validation
-- If symbolic solving fails, try numerical methods
-- Do NOT use `answer` as a variable name - it is reserved for the system
-
-{env_tips}
-"""
-
-    OOLONG_SYSTEM_PROMPT = """You are Pythonformer AI assistant that solves long-context problems by programmatically analyzing documents with Python code.
-
-## CRITICAL: Long Context Strategy
-
-The context document is TOO LARGE to process in one pass. It has been saved to your workspace ({context_length:,} characters). You MUST use Python to:
-
-1. Load and explore the context structure
-2. Search, filter, and chunk as needed
-3. Use `sub_agent()` for semantic analysis of chunks
-4. Aggregate results programmatically
-5. Verify your answer before submitting
-
-## File Input Format
-
-Long context files are provided in <file> tags:
-<file name="context.txt" type="txt" chars="{context_length}">
-[Content saved to workspace - use read_file('context.txt') to load]
-</file>
-
-## Response Format
-
-Use <python> tags for code, <final_answer> for your answer:
-
-<python>
-# Step 1: Load and explore the context
-context = read_file('context.txt')
-lines = context.strip().split('\\n')
-print(f"Total lines: {{len(lines)}}")
-print(f"First 5 lines:\\n{{chr(10).join(lines[:5])}}")
-</python>
-
-## Available Tools
-
-### File Operations
-- `read_file('context.txt')` - Load the full context
-- `read_file('context.txt', lines=100)` - Read last 100 lines
-- `save_to_file(name, content)` - Save intermediate results
-- `list_files(pattern)` - List workspace files
-
-### Sub-Agent for Semantic Analysis
-- `sub_agent(task, system_prompt=None)` - Invoke a sub-agent for semantic tasks
-
-Use `sub_agent()` when you need semantic understanding. The response appears in <sub_agent> tags:
-<python>
-# Example: Classify or extract meaning from a chunk
-chunk = '\\n'.join(lines[0:50])
-result = sub_agent(
-    task=f"How many dice rolls are mentioned in this text? Return just the number.\\n\\nText:\\n{{chunk}}",
-    system_prompt="You are a precise counter. Return only the number."
-)
-print(f"Rolls in chunk: {{result}}")
-</python>
-
-The system returns sub-agent responses in <sub_agent> tags:
-<sub_agent task="How many dice rolls...">
-12
-</sub_agent>
-
-### Python Standard Library
-- `re` for regex search/matching
-- `collections.Counter` for counting
-- String methods: split, find, count, etc.
-
-## Strategy Examples
-
-### Counting Pattern Occurrences
-<python>
-import re
-context = read_file('context.txt')
-# Count all dice rolls like "rolls a 15" or "rolled 20"
-rolls = re.findall(r'rolls?\\s+(?:a\\s+)?(\\d+)', context, re.IGNORECASE)
-print(f"Found {{len(rolls)}} rolls")
-print(f"Sample rolls: {{rolls[:10]}}")
-</python>
-
-### Chunked Semantic Analysis with Sub-Agent
-<python>
-context = read_file('context.txt')
-lines = context.split('\\n')
-chunk_size = 200
-results = []
-
-for i in range(0, min(len(lines), 1000), chunk_size):
-    chunk = '\\n'.join(lines[i:i+chunk_size])
-    count = sub_agent(
-        task=f"Count dice rolls in this D&D transcript chunk. Return just the number.\\n\\n{{chunk}}",
-        system_prompt="You count dice rolls. Return only an integer."
-    )
-    results.append(int(count) if count.isdigit() else 0)
-    print(f"Chunk {{i//chunk_size}}: {{results[-1]}} rolls")
-
-total = sum(results)
-print(f"Total rolls: {{total}}")
-</python>
-
-## IMPORTANT RULES
-
-1. NEVER try to read the entire context in one LLM response - use Python
-2. ALWAYS execute code before giving <final_answer>
-3. Use `sub_agent()` for semantic tasks (understanding meaning, classification)
-4. Use Python/regex for syntactic tasks (counting patterns, searching)
-5. Put your final answer in \\boxed{{}}
-6. Do NOT generate <repl>, <state>, or <sub_agent> tags - system provides those
-7. Do NOT use `answer` as a variable name - it is reserved for the system
-
-## Final Answer Format
-
-<final_answer>
-The answer is \\boxed{{84}}.
-</final_answer>
-
-{env_tips}
-"""
-    
     def __init__(self, config: PythonformerConfig):
         self.config = config
         self.stats = PipelineStats()
@@ -346,6 +144,16 @@ The answer is \\boxed{{84}}.
         # LLM orchestrator for generating responses
         self.orchestrator = None
         self._init_orchestrator()
+        
+        # Reward function (pluggable, can be disabled)
+        self.enable_rewards = getattr(config.dataset, 'enable_rewards', True)
+        if self.enable_rewards:
+            reward_fn_name = getattr(config.dataset, 'reward_function', 'simple')
+            self.reward_function = get_reward_function(reward_fn_name)
+            print(f"Reward function: {self.reward_function.name}")
+        else:
+            self.reward_function = None
+            print("Reward computation: DISABLED")
         
         # Setup output
         self.output_dir = Path(config.dataset.output_dir)
@@ -388,14 +196,20 @@ The answer is \\boxed{{84}}.
         """Build system prompt with environment-specific tips."""
         env_tips = ENV_TIPS.get(env_type, "")
         
-        # Use OOLONG-specific prompt for long-context tasks
+        # Use task-specific prompts
         if env_type == EnvironmentType.OOLONG:
-            return self.OOLONG_SYSTEM_PROMPT.format(
+            return OOLONG_SYSTEM_PROMPT.format(
+                context_length=context_length,
+                env_tips=env_tips
+            )
+        elif env_type == EnvironmentType.HOTPOTQA:
+            return HOTPOTQA_SYSTEM_PROMPT.format(
                 context_length=context_length,
                 env_tips=env_tips
             )
         
-        return self.SYSTEM_PROMPT.format(
+        # Default prompt for other tasks
+        return BASE_SYSTEM_PROMPT.format(
             max_output=self.config.repl.max_output_chars,
             env_tips=env_tips
         )
@@ -543,9 +357,11 @@ The answer is \\boxed{{84}}.
         )
         
         try:
-            # For OOLONG: save context to file via code execution
+            # Save context to file(s) based on environment type
             context_length = len(context) if context else 0
+            
             if env_type == EnvironmentType.OOLONG and context:
+                # OOLONG: Single large context file
                 # Save context to file - escape for Python string
                 # Use a chunked approach to avoid huge string literals
                 chunk_size = 50000
@@ -560,8 +376,60 @@ The answer is \\boxed{{84}}.
                 if self.config.debug:
                     print(f"Saved context to context.txt ({context_length:,} chars)")
             
+            elif env_type == EnvironmentType.HOTPOTQA and context:
+                # HotpotQA: Multiple document files for multi-hop reasoning
+                # Parse context into separate documents and save each as a file
+                if self.config.debug:
+                    print(f"[DEBUG] HotpotQA context length: {len(context)} chars")
+                    print(f"[DEBUG] Context starts with: {context[:200]}")
+                
+                documents = []
+                current_doc = None
+                
+                for line in context.split('\n'):
+                    if line.startswith('## '):
+                        if current_doc:
+                            documents.append(current_doc)
+                        current_doc = {'title': line[3:].strip(), 'text': ''}
+                    elif current_doc is not None:
+                        current_doc['text'] += line + '\n'
+                
+                if current_doc:
+                    documents.append(current_doc)
+                
+                if self.config.debug:
+                    print(f"[DEBUG] Parsed {len(documents)} documents")
+                    if documents:
+                        print(f"[DEBUG] First doc title: {documents[0]['title']}")
+                
+                # Save each document as a separate file
+                for i, doc in enumerate(documents):
+                    # Create safe filename from title
+                    safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in doc['title'])
+                    safe_title = safe_title.replace(' ', '_')[:50]  # Limit length
+                    filename = f"doc_{i+1:02d}_{safe_title}.txt"
+                    
+                    if self.config.debug:
+                        print(f"[DEBUG] Creating file: {filename} ({len(doc['text'])} chars)")
+                    
+                    # Escape content for Python string
+                    escaped_text = doc['text'].replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '\\r')
+                    init_code = f"with open('{filename}', 'w') as f: f.write('{escaped_text}')"
+                    result = repl_client.execute(init_code)
+                    
+                    if self.config.debug and result.error:
+                        print(f"[DEBUG] Error creating {filename}: {result.error}")
+                
+                if self.config.debug:
+                    print(f"Saved {len(documents)} documents to workspace ({context_length:,} chars total)")
+            
             turns: List[Turn] = []
             num_code_blocks = 0
+            
+            # Reward tracking
+            step_rewards: List[float] = []
+            total_reward: float = 0.0
+            num_errors: int = 0
             
             # Get initial state from REPL (shows pre-imported modules)
             initial_state = repl_client.get_state()
@@ -572,12 +440,16 @@ The answer is \\boxed{{84}}.
             
             # Initial user message
             user_msg = prompt
-            if context and env_type != EnvironmentType.OOLONG:
-                # For non-OOLONG: mention context variable
-                user_msg += f"\n\n[Context available as `context` variable ({len(context):,} chars) or in 'context.txt']"
-            elif context and env_type == EnvironmentType.OOLONG:
+            if context and env_type == EnvironmentType.OOLONG:
                 # For OOLONG: use <file> tag to indicate context location
                 user_msg += f'\n\n<file name="context.txt" type="txt" chars="{context_length}">\n[Content saved to workspace - use read_file(\'context.txt\') to load]\n</file>'
+            elif context and env_type == EnvironmentType.HOTPOTQA:
+                # For HotpotQA: indicate multiple document files
+                num_docs = context.count('\n## ') + (1 if context.startswith('## ') else 0)
+                user_msg += f'\n\n<file name="documents" type="multiple" count="{num_docs}" chars="{context_length}">\n[{num_docs} documents saved to workspace as separate files]\n[Use list_files("doc_*.txt") to see all documents]\n[Use read_file("doc_XX_Title.txt") to read a specific document]\n</file>'
+            elif context and env_type not in [EnvironmentType.OOLONG, EnvironmentType.HOTPOTQA]:
+                # For other tasks: mention context variable
+                user_msg += f"\n\n[Context available as `context` variable ({len(context):,} chars) or in 'context.txt']"
             
             # Optionally prepend initial state info
             if initial_state_str and initial_state_str != "(empty state)":
@@ -657,7 +529,10 @@ The answer is \\boxed{{84}}.
                         final_answer=final_answer,
                         turns=turns,
                         num_code_blocks=num_code_blocks,
-                        system_prompt=system_prompt
+                        system_prompt=system_prompt,
+                        total_reward=total_reward,
+                        step_rewards=step_rewards,
+                        num_errors=num_errors,
                     )
                 
                 if not python_blocks:
@@ -672,7 +547,10 @@ The answer is \\boxed{{84}}.
                             final_answer=response,  # Use the whole response as final answer
                             turns=turns,
                             num_code_blocks=num_code_blocks,
-                            system_prompt=system_prompt
+                            system_prompt=system_prompt,
+                            total_reward=total_reward,
+                            step_rewards=step_rewards,
+                            num_errors=num_errors,
                         )
                     break
                 
@@ -684,6 +562,12 @@ The answer is \\boxed{{84}}.
                     
                     result = repl_client.execute(code)
                     num_code_blocks += 1
+                    
+                    # Track rewards
+                    step_rewards.append(result.reward)
+                    total_reward += result.reward
+                    if result.error:
+                        num_errors += 1
                     
                     # Pretty print REPL output in debug mode
                     if self.config.debug:
@@ -734,7 +618,10 @@ The answer is \\boxed{{84}}.
                 final_answer="",
                 turns=turns,
                 num_code_blocks=num_code_blocks,
-                system_prompt=system_prompt
+                system_prompt=system_prompt,
+                total_reward=total_reward + self.config.repl.reward_on_failure if hasattr(self.config.repl, 'reward_on_failure') else total_reward - 0.1,
+                step_rewards=step_rewards,
+                num_errors=num_errors,
             )
         
         finally:
@@ -779,6 +666,9 @@ The answer is \\boxed{{84}}.
                 "final_answer": result.final_answer,
                 "num_turns": len(result.turns),
                 "num_code_blocks": result.num_code_blocks,
+                # Reward tracking for filtering/analysis
+                "total_reward": result.total_reward,
+                "num_errors": result.num_errors,
             }
         }
     
@@ -841,22 +731,59 @@ The answer is \\boxed{{84}}.
         processor = self.config.dataset.context_processor
         
         if processor == "hotpotqa":
-            # HotpotQA has context as list of [title, sentences] pairs
+            # HotpotQA has context as list of dicts with 'title' and 'sentences' keys
+            # Example: [{"title": "Arthur's Magazine", "sentences": ["...", "..."]}, ...]
             context_data = row.get("context", [])
+            
+            if self.config.debug:
+                print(f"[DEBUG] HotpotQA context_data type: {type(context_data)}")
+                if isinstance(context_data, dict):
+                    print(f"[DEBUG] Context is dict with keys: {context_data.keys()}")
+                elif isinstance(context_data, list):
+                    print(f"[DEBUG] Context is list with {len(context_data)} items")
+            
             if not context_data:
                 return None
             
             parts = []
-            titles = context_data.get("title", []) if isinstance(context_data, dict) else []
-            sentences_list = context_data.get("sentences", []) if isinstance(context_data, dict) else []
             
-            for i, title in enumerate(titles):
-                sentences = sentences_list[i] if i < len(sentences_list) else []
-                if sentences:
-                    text = " ".join(sentences)
-                    parts.append(f"## {title}\n{text}")
+            # Handle both formats: list of dicts OR dict with title/sentences lists
+            if isinstance(context_data, dict):
+                # Format: {"title": [...], "sentences": [[...], [...]]}
+                titles = context_data.get("title", [])
+                sentences_list = context_data.get("sentences", [])
+                
+                if self.config.debug:
+                    print(f"[DEBUG] Dict format: {len(titles)} titles, {len(sentences_list)} sentence lists")
+                
+                for i, title in enumerate(titles):
+                    if i < len(sentences_list):
+                        sentences = sentences_list[i]
+                        if sentences:
+                            text = " ".join(sentences)
+                            parts.append(f"## {title}\n{text}")
             
-            return "\n\n".join(parts) if parts else None
+            elif isinstance(context_data, list):
+                # Format: [{"title": "...", "sentences": [...]}, ...]
+                if self.config.debug:
+                    print(f"[DEBUG] List format: {len(context_data)} documents")
+                
+                for doc in context_data:
+                    if isinstance(doc, dict):
+                        title = doc.get("title", "")
+                        sentences = doc.get("sentences", [])
+                        if title and sentences:
+                            text = " ".join(sentences)
+                            parts.append(f"## {title}\n{text}")
+            
+            result = "\n\n".join(parts) if parts else None
+            
+            if self.config.debug:
+                print(f"[DEBUG] Processed {len(parts)} documents, total length: {len(result) if result else 0} chars")
+                if result:
+                    print(f"[DEBUG] First 200 chars: {result[:200]}")
+            
+            return result
         
         elif processor == "oolong":
             # Oolong has context_window_text + question
@@ -991,6 +918,14 @@ The answer is \\boxed{{84}}.
             return self.load_math_tasks(limit)
         elif env == EnvironmentType.OOLONG:
             return self.load_long_context_tasks(limit)
+        elif env == EnvironmentType.HOTPOTQA:
+            # Fallback to HotpotQA distractor
+            return self.load_from_huggingface(
+                "hotpotqa/hotpot_qa",
+                "distractor",
+                "validation",
+                limit
+            )
         else:
             raise ValueError(f"No dataset configured for environment: {env}")
     
@@ -1041,6 +976,33 @@ The answer is \\boxed{{84}}.
                 if answer_correct is None:
                     answer_correct = False
             
+            # ============================================================
+            # Compute reward using pluggable reward function (if enabled)
+            # ============================================================
+            reward_metadata = None
+            
+            if self.enable_rewards and self.reward_function:
+                metrics = TrajectoryMetrics(
+                    answer_correct=answer_correct,
+                    num_turns=len(result.turns),
+                    num_code_blocks=result.num_code_blocks,
+                    num_errors=result.num_errors,
+                    max_turns=self.config.repl.max_turns,
+                    intermediate_rewards=result.step_rewards,
+                    success=result.success,
+                )
+                
+                reward_result = self.reward_function.compute(metrics)
+                
+                # Update trajectory result with computed rewards
+                result.total_reward = reward_result["total_reward"]
+                result.step_rewards.append(reward_result["final_step_reward"])
+                reward_metadata = reward_result.get("metadata", {})
+            else:
+                # Rewards disabled - keep intermediate rewards only
+                # total_reward will be sum of intermediate rewards (errors, etc.)
+                pass
+            
             # Record stats after computing answer_correct
             self.stats.record(result, answer_correct=answer_correct)
             
@@ -1055,6 +1017,11 @@ The answer is \\boxed{{84}}.
                 "answer_correct": answer_correct,
                 "num_turns": len(result.turns),
                 "num_code_blocks": result.num_code_blocks,
+                # Reward tracking for filtering/analysis
+                "total_reward": result.total_reward,
+                "step_rewards": result.step_rewards,
+                "num_errors": result.num_errors,
+                "reward_metadata": reward_metadata,  # None if rewards disabled
                 "turns": [
                     {"role": t.role, "content": t.content, "code": t.code}
                     for t in result.turns

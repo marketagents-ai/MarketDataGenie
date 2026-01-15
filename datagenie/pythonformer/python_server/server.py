@@ -100,9 +100,13 @@ def create_session():
     context = data.get("context")
     packages = data.get("packages", ["numpy", "pandas", "sympy", "json", "re", "math"])
     max_output = data.get("max_output_chars", MAX_OUTPUT_CHARS)
+    max_iterations = data.get("max_iterations", 30)
     
     # Sub-agent config (passed from pipeline config)
     sub_agent_config = data.get("sub_agent_config", {})
+    
+    # RL reward config (optional)
+    reward_config = data.get("reward_config", {})
     
     session_id = str(uuid.uuid4())[:8]
     
@@ -110,7 +114,14 @@ def create_session():
         max_output_chars=max_output,
         packages=packages,
         enable_filesystem=True,
+        reward_on_success=reward_config.get("on_success", 1.0),
+        reward_on_iteration=reward_config.get("on_iteration", 0.0),
+        reward_on_error=reward_config.get("on_error", -0.05),
+        reward_on_failure=reward_config.get("on_failure", -0.1),
     )
+    
+    # Set max iterations
+    sandbox._max_iterations = max_iterations
     
     # Store sub-agent config in sandbox for later use
     sandbox.sub_agent_config = sub_agent_config
@@ -133,11 +144,27 @@ def create_session():
     return jsonify({
         "session_id": session_id,
         "workspace": str(sandbox.workspace_dir),
+        "max_iterations": max_iterations,
         "available_functions": [
+            # Sub-agent
             "sub_agent(task, system_prompt=None, context=None) - Invoke sub-agent for semantic analysis",
-            "save_to_file(filename, content) - Save to workspace",
-            "read_file(filename, lines=N) - Read from workspace",
+            "sub_agent_batch(tasks, system_prompt=None) - Batch sub-agent calls",
+            # File I/O (auto-detects json/csv)
+            "save_to_file(filename, content) - Save to workspace (auto-serializes json/csv)",
+            "read_file(filename, lines=N, raw=False) - Read file (auto-parses json/csv)",
             "list_files(pattern) - List workspace files",
+            "file_exists(filename) - Check if file exists",
+            # Enhanced file ops
+            "get_file_info(filename) - Get file metadata (size, lines, type)",
+            "search_files(query, pattern='*', max_results=20) - Search content in files",
+            # Scratch vs output organization
+            "save_scratch(filename, content) - Save to scratch/ (temporary)",
+            "save_output(filename, content) - Save to output/ (artifacts)",
+            "list_scratch() - List scratch files",
+            "list_output() - List output files",
+            # Finalization
+            "FINAL(value) - Signal task completion with final answer",
+            "FINAL_VAR('var_name') - Signal completion with variable value",
             "answer dict - Set answer['content'] and answer['ready']=True when done",
         ]
     })
@@ -161,6 +188,7 @@ def execute_in_session(session_id: str):
     
     state_snapshot = session.sandbox.get_state_snapshot()
     state_formatted = session.sandbox.format_state_for_context()
+    episode_state = session.sandbox.get_episode_state()
     
     return jsonify({
         "success": result.success,
@@ -178,6 +206,12 @@ def execute_in_session(session_id: str):
             {"task": c.task, "system_prompt": c.system_prompt, "response": c.response}
             for c in result.sub_agent_calls
         ],
+        # RLM-style fields
+        "done": result.done,
+        "final_answer": result.final_answer,
+        "iteration": result.iteration,
+        "reward": result.reward,
+        "episode_state": episode_state,
     })
 
 
@@ -190,6 +224,7 @@ def get_session_state(session_id: str):
     
     state_snapshot = session.sandbox.get_state_snapshot()
     state_formatted = session.sandbox.format_state_for_context()
+    episode_state = session.sandbox.get_episode_state()
     
     return jsonify({
         "session_id": session_id,
@@ -201,6 +236,11 @@ def get_session_state(session_id: str):
         "execution_count": session.execution_count,
         "created_at": session.created_at,
         "last_accessed": session.last_accessed,
+        # RLM-style fields
+        "done": session.sandbox.done,
+        "final_answer": session.sandbox.final_answer,
+        "iteration": session.sandbox.iteration,
+        "episode_state": episode_state,
     })
 
 

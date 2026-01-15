@@ -11,6 +11,7 @@ class EnvironmentType(Enum):
     """Task environment types."""
     MATH_PYTHON = "math-python"
     OOLONG = "oolong"  # Long-context
+    HOTPOTQA = "hotpotqa"  # Multi-hop reasoning
     CODE = "code"      # Code generation
     CUSTOM = "custom"
 
@@ -86,6 +87,12 @@ class DatasetConfig:
     output_dir: str = "outputs/pythonformer"
     output_sharegpt: bool = True
     mask_observations: bool = False  # If True, add loss_weight=0 to observations
+    
+    # Reward function for trajectory evaluation
+    # Options: "simple", "efficiency", "normalized"
+    # See datagenie/pythonformer/reward_functions/ for details
+    enable_rewards: bool = True  # Set to False to disable reward computation
+    reward_function: str = "simple"
 
 
 @dataclass

@@ -33,6 +33,12 @@ class ExecutionResult:
     state: Dict[str, Any] = None  # Full state snapshot
     state_formatted: str = None   # Formatted state string
     sub_agent_calls: List[SubAgentCall] = None  # Sub-agent calls made during execution
+    # RLM-style fields
+    done: bool = False  # Episode complete (FINAL called or answer ready)
+    final_answer: Optional[str] = None  # Extracted final answer
+    iteration: int = 0  # Current iteration count
+    reward: float = 0.0  # Step reward for RL training
+    episode_state: Dict[str, Any] = None  # Full episode state
     
     def __post_init__(self):
         if self.files_created is None:
@@ -47,6 +53,8 @@ class ExecutionResult:
             self.state_formatted = "(empty state)"
         if self.sub_agent_calls is None:
             self.sub_agent_calls = []
+        if self.episode_state is None:
+            self.episode_state = {}
 
 
 class REPLClient:
@@ -73,7 +81,9 @@ class REPLClient:
         context: Optional[str] = None,
         packages: Optional[List[str]] = None,
         max_output_chars: int = 8192,
+        max_iterations: int = 30,
         sub_agent_config: Optional[Dict[str, Any]] = None,
+        reward_config: Optional[Dict[str, float]] = None,
     ) -> str:
         """
         Create a new REPL session.
@@ -82,18 +92,25 @@ class REPLClient:
             context: Optional large context to make available
             packages: Python packages to pre-import
             max_output_chars: Max output truncation limit
+            max_iterations: Max iterations before episode ends
             sub_agent_config: Config for sub-agent calls (model, client, temperature, max_tokens)
+            reward_config: RL reward configuration (on_success, on_iteration, on_error, on_failure)
             
         Returns:
             Session ID
         """
-        payload = {"max_output_chars": max_output_chars}
+        payload = {
+            "max_output_chars": max_output_chars,
+            "max_iterations": max_iterations,
+        }
         if context:
             payload["context"] = context
         if packages:
             payload["packages"] = packages
         if sub_agent_config:
             payload["sub_agent_config"] = sub_agent_config
+        if reward_config:
+            payload["reward_config"] = reward_config
         
         resp = requests.post(
             f"{self.server_url}/session/create",
@@ -150,6 +167,12 @@ class REPLClient:
             state=data.get("state", {"variables": {}, "functions": {}, "classes": {}, "modules": []}),
             state_formatted=data.get("state_formatted", "(empty state)"),
             sub_agent_calls=sub_agent_calls,
+            # RLM-style fields
+            done=data.get("done", False),
+            final_answer=data.get("final_answer"),
+            iteration=data.get("iteration", 0),
+            reward=data.get("reward", 0.0),
+            episode_state=data.get("episode_state", {}),
         )
     
     def get_state(self, session_id: Optional[str] = None) -> Dict[str, Any]:
