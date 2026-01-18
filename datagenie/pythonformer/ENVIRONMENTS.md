@@ -9,6 +9,7 @@ Quick reference for all supported task environments.
 | **base** | `default_config.yaml` | Optional | 0-1 | Direct solving | Solve x² - 4 = 0 |
 | **oolong** | `oolong_config.yaml` | 150K+ chars | 1 large file | Chunking + map-reduce | Count rolls in transcript |
 | **hotpotqa** | `hotpotqa_config.yaml` | 5-10K chars | 10 small files | Document hopping | Which magazine started first? |
+| **swe** | `swe_config.yaml` | Repository | /testbed | Code exploration + editing | Fix bug in calculate_sum() |
 
 ## Base Environment
 
@@ -154,6 +155,90 @@ else:
 - **Distractor**: 10 documents (2 relevant + 8 distractors)
 - **Fullwiki**: Full Wikipedia retrieval (harder)
 
+## SWE Environment
+
+**Purpose**: Software engineering tasks - bug fixing and feature implementation
+
+**Context Format**:
+- Repository cloned at `/testbed`
+- Pre-configured Docker environment with dependencies installed
+- Test suite available
+
+**Prompt**: `prompts/swe.py`
+
+**Tools**:
+- **Python blocks** (`<python>`) - For code analysis and file editing
+- **Bash blocks** (`<bash>`) - For shell commands
+- File operations (read_file, save_to_file)
+- Standard Unix tools (grep, find, ls, git, pytest)
+
+**Strategy**:
+1. Understand the problem statement
+2. Explore codebase structure
+3. Locate relevant files
+4. Read and analyze code
+5. Make necessary changes
+6. Run tests to verify fix
+
+**Example**:
+```bash
+# Step 1: Explore the repository
+cd /testbed
+find . -name "*.py" | grep -E "(calculator|math)" | head -10
+```
+
+```python
+# Step 2: Read the buggy file
+with open('/testbed/src/calculator.py', 'r') as f:
+    content = f.read()
+print(content)
+```
+
+```bash
+# Step 3: Search for the function
+grep -rn "def calculate_sum" /testbed/src
+```
+
+```python
+# Step 4: Fix the bug
+with open('/testbed/src/calculator.py', 'r') as f:
+    content = f.read()
+
+# Replace the buggy line
+new_content = content.replace(
+    'return a - b  # BUG: should be addition',
+    'return a + b  # Fixed: now correctly adds'
+)
+
+with open('/testbed/src/calculator.py', 'w') as f:
+    f.write(new_content)
+
+print("✓ Fixed calculate_sum() function")
+```
+
+```bash
+# Step 5: Run tests
+cd /testbed
+python -m pytest tests/test_calculator.py -xvs
+```
+
+**Use Cases**:
+- Bug fixing
+- Feature implementation
+- Code refactoring
+- Test-driven development
+
+**Dataset**: [SWE-bench/SWE-smith-py](https://huggingface.co/datasets/SWE-bench/SWE-smith-py)
+- Real-world Python repositories
+- Pre-built Docker images with repos at `/testbed`
+- Test suites for validation (FAIL_TO_PASS, PASS_TO_PASS)
+
+**Key Features**:
+- **Dual execution modes**: Python for precise editing, Bash for exploration
+- **Test-based validation**: Solutions verified by running test suites
+- **Pre-configured environments**: Docker images with all dependencies
+- **Real repositories**: Actual open-source projects (conan, pytest, etc.)
+
 ## Comparison
 
 ### Context Management
@@ -163,6 +248,7 @@ else:
 | base | 0-1 | Small | Direct |
 | oolong | 1 | 150K+ chars | Sequential chunks |
 | hotpotqa | 10 | 5-10K total | Selective hopping |
+| swe | Many | Repository | Exploration + targeted edits |
 
 ### Sub-Agent Usage
 
@@ -171,6 +257,7 @@ else:
 | base | Optional semantic analysis | Rare |
 | oolong | Chunk analysis (map-reduce) | High (5-10 calls) |
 | hotpotqa | Entity extraction | Medium (2-3 calls) |
+| swe | Code understanding (optional) | Low (0-2 calls) |
 
 ### Complexity
 
@@ -179,6 +266,7 @@ else:
 | base | Direct | 2-4 | 1-2 |
 | oolong | Aggregation | 4-8 | 3-6 |
 | hotpotqa | Multi-hop | 2-4 | 1-2 |
+| swe | Iterative debugging | 5-15 | 3-10 |
 
 ## Running Examples
 
@@ -198,6 +286,12 @@ python -m datagenie.pythonformer.run \
 python -m datagenie.pythonformer.run \
     --config datagenie/pythonformer/configs/hotpotqa_config.yaml \
     --limit 4 \
+    --debug
+
+# SWE: Software engineering tasks
+python -m datagenie.pythonformer.run \
+    --config datagenie/pythonformer/configs/swe_config.yaml \
+    --limit 2 \
     --debug
 ```
 

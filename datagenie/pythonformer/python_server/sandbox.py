@@ -86,6 +86,7 @@ class PythonSandbox:
         packages: Optional[List[str]] = None,
         workspace_dir: Optional[str] = None,
         enable_filesystem: bool = True,
+        enable_bash: bool = False,  # Disabled by default, enable for SWE tasks
         # RL reward configuration
         reward_on_success: float = 1.0,
         reward_on_iteration: float = 0.0,
@@ -99,6 +100,7 @@ class PythonSandbox:
         self.timeout_seconds = timeout_seconds
         self.llm_batch_callback = llm_batch_callback
         self.enable_filesystem = enable_filesystem
+        self.enable_bash = enable_bash
         
         # RL reward configuration
         self.reward_on_success = reward_on_success
@@ -184,11 +186,15 @@ class PythonSandbox:
             'sum': sum, 'tuple': tuple, 'type': type, 'zip': zip,
             'True': True, 'False': False, 'None': None,
             '__import__': __import__,
+            '__build_class__': __build_class__,  # Required for class definitions
             'open': self._sandboxed_open if self.enable_filesystem else open,
             'input': input,
         }
         
         self._namespace['__builtins__'] = safe_builtins
+        # Add required module-level attributes
+        self._namespace['__name__'] = '__main__'
+        self._namespace['__doc__'] = None
         self._namespace['answer'] = {"content": "", "ready": False}
         
         # RLM-style finalization helpers
@@ -244,11 +250,27 @@ class PythonSandbox:
         return self._final_helper(value)
     
     def _sandboxed_open(self, path, mode='r', *args, **kwargs):
-        """Sandboxed open() that restricts to workspace directory."""
+        """Sandboxed open() that restricts to workspace directory.
+        
+        For SWE tasks (enable_bash=True), also allows access to /testbed.
+        """
         path = Path(path)
         if not path.is_absolute():
             path = self.workspace_dir / path
         
+        # For SWE tasks, allow access to /testbed
+        if self.enable_bash:
+            testbed_path = Path('/testbed')
+            path_str = str(path)
+            
+            # Check if path starts with /testbed
+            if path_str.startswith('/testbed'):
+                # Allow access to /testbed
+                if 'w' in mode or 'a' in mode:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                return open(path, mode, *args, **kwargs)
+        
+        # Check workspace access
         try:
             path.resolve().relative_to(self.workspace_dir.resolve())
         except ValueError:
@@ -707,6 +729,87 @@ class PythonSandbox:
             result.reward = self.reward_on_iteration
         
         self.history.append((code, result))
+        return result
+    
+    def execute_bash(self, code: str, timeout: Optional[int] = None) -> ExecutionResult:
+        """
+        Execute bash commands in the sandbox workspace.
+        
+        Args:
+            code: Bash commands to execute
+            timeout: Optional timeout in seconds (defaults to self.timeout_seconds)
+            
+        Returns:
+            ExecutionResult with stdout/stderr
+            
+        Raises:
+            RuntimeError: If bash execution is not enabled
+        """
+        import subprocess
+        import time
+        
+        # Check if bash is enabled
+        if not self.enable_bash:
+            return ExecutionResult(
+                success=False,
+                output="",
+                error="Bash execution is not enabled for this sandbox. Set enable_bash=True to use bash commands.",
+                answer_state=self._namespace.get('answer', {}).copy(),
+                iteration=self._iteration,
+            )
+        
+        timeout = timeout or self.timeout_seconds
+        start_time = time.time()
+        
+        # Increment iteration counter
+        self._iteration += 1
+        
+        result = ExecutionResult(
+            success=False,
+            output="",
+            answer_state=self._namespace.get('answer', {}).copy(),
+            iteration=self._iteration,
+        )
+        
+        try:
+            # Run bash command in workspace directory
+            proc = subprocess.run(
+                code,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(self.workspace_dir) if self.enable_filesystem else None,
+                env=os.environ.copy()
+            )
+            
+            # Combine stdout and stderr
+            output = proc.stdout
+            if proc.stderr:
+                output += f"\n[stderr]:\n{proc.stderr}"
+            
+            result.output, result.truncated = self._truncate_output(output)
+            result.success = (proc.returncode == 0)
+            
+            if proc.returncode != 0:
+                result.error = f"Exit code: {proc.returncode}"
+            
+        except subprocess.TimeoutExpired:
+            result.error = f"Command timed out after {timeout}s"
+            result.output = "[Timeout]"
+        except Exception as e:
+            result.error = f"{type(e).__name__}: {e}"
+            result.output = ""
+        
+        result.execution_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Track file changes
+        if self.enable_filesystem:
+            result.files_created, result.files_modified = self._get_file_changes()
+        
+        # Bash commands don't affect Python namespace, but track for history
+        self.history.append((f"[bash] {code}", result))
+        
         return result
     
     def get_answer(self) -> Dict[str, Any]:

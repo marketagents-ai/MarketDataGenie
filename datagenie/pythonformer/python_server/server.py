@@ -101,6 +101,7 @@ def create_session():
     packages = data.get("packages", ["numpy", "pandas", "sympy", "json", "re", "math"])
     max_output = data.get("max_output_chars", MAX_OUTPUT_CHARS)
     max_iterations = data.get("max_iterations", 30)
+    enable_bash = data.get("enable_bash", False)  # Disabled by default
     
     # Sub-agent config (passed from pipeline config)
     sub_agent_config = data.get("sub_agent_config", {})
@@ -114,6 +115,7 @@ def create_session():
         max_output_chars=max_output,
         packages=packages,
         enable_filesystem=True,
+        enable_bash=enable_bash,
         reward_on_success=reward_config.get("on_success", 1.0),
         reward_on_iteration=reward_config.get("on_iteration", 0.0),
         reward_on_error=reward_config.get("on_error", -0.05),
@@ -241,6 +243,34 @@ def get_session_state(session_id: str):
         "final_answer": session.sandbox.final_answer,
         "iteration": session.sandbox.iteration,
         "episode_state": episode_state,
+    })
+
+
+@app.route("/session/<session_id>/execute_bash", methods=["POST"])
+def execute_bash_in_session(session_id: str):
+    """Execute bash commands in an existing session."""
+    session = get_session(session_id)
+    if not session:
+        return jsonify({"error": f"Session {session_id} not found"}), 404
+    
+    data = request.json or {}
+    code = data.get("code", "")
+    timeout = data.get("timeout")
+    
+    if not code:
+        return jsonify({"error": "No code provided"}), 400
+    
+    result = session.sandbox.execute_bash(code, timeout=timeout)
+    session.execution_count += 1
+    
+    return jsonify({
+        "success": result.success,
+        "output": result.output,
+        "error": result.error,
+        "truncated": result.truncated,
+        "execution_time_ms": result.execution_time_ms,
+        "files_created": result.files_created,
+        "execution_count": session.execution_count,
     })
 
 

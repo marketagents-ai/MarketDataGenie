@@ -12,6 +12,7 @@ class EnvironmentType(Enum):
     MATH_PYTHON = "math-python"
     OOLONG = "oolong"  # Long-context
     HOTPOTQA = "hotpotqa"  # Multi-hop reasoning
+    SWE = "swe"  # Software engineering / bug fixing
     CODE = "code"      # Code generation
     CUSTOM = "custom"
 
@@ -75,6 +76,11 @@ class DatasetConfig:
     # Context processor for complex nested fields
     # Options: null, "hotpotqa", "oolong"
     context_processor: Optional[str] = None
+    
+    # Repository filtering (for SWE tasks)
+    # List of repo names to include, or None/empty for all repos
+    # Example: ["swesmith/pydantic__pydantic.acb0f10f"]
+    filter_repos: Optional[List[str]] = None
     
     # Generation settings
     batch_size: int = 4

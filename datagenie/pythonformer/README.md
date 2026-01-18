@@ -11,6 +11,7 @@ Pythonformer supports multiple task types, each with specialized prompts and con
 | **base** | General problem-solving | Single context or none | Math, algorithms, data analysis |
 | **oolong** | Long-context analysis | Single large file (150K+ chars) | Document analysis, counting, aggregation |
 | **hotpotqa** | Multi-hop reasoning | Multiple document files | Cross-document reasoning, fact verification |
+| **swe** | Software engineering | Repository at `/testbed` | Bug fixing, feature implementation |
 
 ### Environment Details
 
@@ -31,6 +32,24 @@ Pythonformer supports multiple task types, each with specialized prompts and con
 - **Context**: Multiple files (`doc_01_Title.txt`, `doc_02_Title.txt`, ...)
 - **Strategy**: Document discovery + multi-hop reasoning
 - **Example**: "Which magazine was started first?", "What is the director's nationality?"
+
+#### 4. SWE Environment
+- **Config**: `configs/swe_config.yaml`
+- **Context**: Repository cloned at `/testbed` (Docker container)
+- **Strategy**: Code exploration + bash commands + file editing
+- **Tools**: `<python>` blocks for code analysis/editing, `<bash>` blocks for shell commands
+- **Docker**: Automatic Docker container management with SWE-smith images
+- **Example**: Fix bugs, implement features, run tests
+
+**SWE-specific features:**
+- Automatic Docker image pulling and container management
+- Repository code available at `/testbed` inside container
+- Bash execution support for shell commands (`pip install`, `pytest`, `git`, etc.)
+- Repository grouping to minimize disk space (only 1 image at a time)
+- 131 repositories from SWE-smith dataset with size metadata
+- Smallest images: 1.18 GB, Average: 1.40 GB, Largest: 7.16 GB
+
+See `swe/README.md` for detailed Docker setup and usage.
 
 ## Pipeline Workflow
 
@@ -214,7 +233,19 @@ python -m datagenie.pythonformer.run \
     --config datagenie/pythonformer/configs/hotpotqa_config.yaml \
     --limit 4 \
     --debug
+
+# SWE environment (software engineering with Docker)
+python -m datagenie.pythonformer.run \
+    --config datagenie/pythonformer/configs/swe_config.yaml \
+    --limit 1 \
+    --debug
 ```
+
+**Note**: SWE environment requires Docker Desktop running. The pipeline will automatically:
+1. Pull the SWE-smith Docker image (~1.2-1.5 GB, cached after first pull)
+2. Start a container with the repository at `/testbed`
+3. Run the REPL server inside the container
+4. Clean up the container after task completion
 
 ## Configuration
 
@@ -339,6 +370,13 @@ datagenie/pythonformer/
 │   ├── base.py                  # General problem-solving
 │   ├── oolong.py                # Long-context analysis
 │   ├── hotpotqa.py              # Multi-hop reasoning
+│   ├── swe.py                   # Software engineering
+│   └── README.md
+├── swe/                         # SWE environment utilities
+│   ├── __init__.py
+│   ├── docker_repl.py           # Docker container management
+│   ├── check_image_sizes.py    # Utility to check image sizes
+│   ├── repo_data.json           # Repository metadata (131 repos)
 │   └── README.md
 ├── reward_functions/            # Pluggable reward system
 │   ├── __init__.py
@@ -367,7 +405,8 @@ datagenie/pythonformer/
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/session/create` | POST | Create new sandbox session |
-| `/session/{id}/execute` | POST | Execute code in session |
+| `/session/{id}/execute` | POST | Execute Python code in session |
+| `/session/{id}/execute_bash` | POST | Execute bash command in session (SWE only) |
 | `/session/{id}/state` | GET | Get session state |
 | `/session/{id}/reset` | POST | Reset session |
 | `/session/{id}` | DELETE | Delete session |
@@ -926,3 +965,51 @@ Esma Sultan Mansion is in the Ortaköy neighborhood.
 | Strategy | Chunking + map-reduce | Document hopping |
 | Sub-agent Use | Chunk analysis | Entity extraction |
 | Complexity | Pattern matching | Cross-document reasoning |
+
+## Analysis & Comparisons
+
+- **[SWE_FEASIBILITY_ANALYSIS.md](./SWE_FEASIBILITY_ANALYSIS.md)** - Detailed analysis of SWE-Agent implementation approach
+- **[SWE_IMPLEMENTATION_PLAN.md](./SWE_IMPLEMENTATION_PLAN.md)** - Step-by-step implementation plan for SWE environment
+- **[PRIME_INTELLECT_COMPARISON.md](./PRIME_INTELLECT_COMPARISON.md)** - Comparison with Prime Intellect's math-rlm environment and recommended improvements
+
+## Future Environments (TODO)
+
+> **Note**: See analysis documents for implementation strategies and learnings.
+
+### 1. Data Analysis Agent
+**Status**: Planned
+
+**Description**: Analyze datasets, compute statistics, generate insights, and create visualizations through computational reasoning.
+
+**Key Capabilities**:
+- Working with structured data (CSV, JSON, Parquet)
+- Statistical analysis and transformations
+- Multi-step data processing pipelines
+- Generating reports and insights
+
+**Tools Needed**:
+- `read_file()` - Load data files
+- `execute_code()` - Run analysis code
+- `sub_agent()` - Delegate complex computations
+- Libraries: pandas, numpy, matplotlib, seaborn, scipy
+
+**Dataset Considerations**:
+- Cannot use DS-1000, BIRD-SQL, DABstep, or similar benchmarks (contamination risk)
+- Create synthetic datasets with known properties
+- Use Kaggle datasets not in common benchmarks
+- Generate data analysis tasks programmatically
+
+**Implementation Notes**:
+- Multi-file support for multiple data files
+- Enhanced REPL with data science libraries
+- Visualization support (save plots as files)
+- Specialized prompt for data analysis workflows
+- Consider adding data validation and quality checks
+
+**Potential Task Types**:
+- Exploratory data analysis (EDA)
+- Statistical hypothesis testing
+- Data cleaning and transformation
+- Feature engineering
+- Correlation and trend analysis
+- Multi-dataset joins and aggregations

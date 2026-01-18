@@ -38,7 +38,7 @@ from datagenie.pythonformer.reward_functions import (
     RewardFunction, TrajectoryMetrics, get_reward_function
 )
 from datagenie.pythonformer.prompts import (
-    BASE_SYSTEM_PROMPT, OOLONG_SYSTEM_PROMPT, HOTPOTQA_SYSTEM_PROMPT
+    BASE_SYSTEM_PROMPT, OOLONG_SYSTEM_PROMPT, HOTPOTQA_SYSTEM_PROMPT, SWE_SYSTEM_PROMPT
 )
 from datagenie.pythonformer.utils.debug import (
     Colors, print_colored, print_header, print_subheader,
@@ -207,6 +207,8 @@ class PythonformerPipeline:
                 context_length=context_length,
                 env_tips=env_tips
             )
+        elif env_type == EnvironmentType.SWE:
+            return SWE_SYSTEM_PROMPT
         
         # Default prompt for other tasks
         return BASE_SYSTEM_PROMPT.format(
@@ -218,6 +220,34 @@ class PythonformerPipeline:
         """Extract Python code from <python> tags."""
         pattern = r'<python>\s*(.*?)\s*</python>'
         return re.findall(pattern, text, re.DOTALL)
+    
+    def _extract_bash_blocks(self, text: str) -> List[str]:
+        """Extract bash commands from <bash> tags."""
+        pattern = r'<bash>\s*(.*?)\s*</bash>'
+        return re.findall(pattern, text, re.DOTALL)
+    
+    def _extract_code_blocks(self, text: str) -> List[Tuple[str, str]]:
+        """
+        Extract both <python> and <bash> blocks in order.
+        
+        Returns:
+            List of (block_type, code) tuples where block_type is "python" or "bash"
+        """
+        blocks = []
+        
+        # Find all python blocks with their positions
+        for match in re.finditer(r'<python>\s*(.*?)\s*</python>', text, re.DOTALL):
+            blocks.append((match.start(), "python", match.group(1).strip()))
+        
+        # Find all bash blocks with their positions
+        for match in re.finditer(r'<bash>\s*(.*?)\s*</bash>', text, re.DOTALL):
+            blocks.append((match.start(), "bash", match.group(1).strip()))
+        
+        # Sort by position to maintain order
+        blocks.sort(key=lambda x: x[0])
+        
+        # Return without position
+        return [(block_type, code) for _, block_type, code in blocks]
     
     def _extract_final_answer(self, text: str) -> Optional[str]:
         """Extract final answer from <final_answer> tags."""
@@ -321,6 +351,7 @@ class PythonformerPipeline:
         prompt: str,
         context: Optional[str] = None,
         env_type: EnvironmentType = EnvironmentType.CODE,
+        task_metadata: Optional[Dict[str, Any]] = None,
     ) -> TrajectoryResult:
         """
         Generate a complete trajectory for a task.
@@ -329,13 +360,65 @@ class PythonformerPipeline:
             prompt: The task/question
             context: Optional large context
             env_type: Environment type for tips
+            task_metadata: Optional task metadata (repo, image_name for SWE tasks)
             
         Returns:
             TrajectoryResult with turns and final answer
         """
-        # Create a NEW REPLClient instance for this task to ensure session isolation
-        # This is critical for parallel execution - each task needs its own session
-        repl_client = REPLClient(server_url=self.config.repl.server_url)
+        # For SWE tasks with Docker support, use DockerREPLSession
+        # Otherwise use local REPL client
+        skip_docker = getattr(self.config.dataset, 'skip_docker', False)
+        
+        use_docker = (
+            env_type == EnvironmentType.SWE and 
+            task_metadata and 
+            'image_name' in task_metadata and
+            'id' in task_metadata and
+            not skip_docker  # Skip Docker if configured
+        )
+        
+        docker_session = None
+        
+        if skip_docker and env_type == EnvironmentType.SWE:
+            if self.config.debug:
+                print(f"[Docker] Skipped (skip_docker=true in config)")
+                print(f"[Docker] Using local REPL server (no /testbed available)")
+        
+        if use_docker:
+            # Import Docker support
+            try:
+                from datagenie.pythonformer.swe.docker_repl import DockerREPLSession
+                
+                # Start Docker container with REPL server and repository code
+                docker_session = DockerREPLSession(
+                    image_name=task_metadata['image_name'],
+                    instance_id=task_metadata['id'],
+                    server_port=5003,
+                    timeout=self.config.repl.timeout_seconds,
+                    cleanup=True
+                )
+                
+                # Start container and get REPL URL
+                repl_url = docker_session.start()
+                repl_client = REPLClient(server_url=repl_url)
+                
+                if self.config.debug:
+                    print(f"[Docker] Started container for {task_metadata['id']}")
+                    print(f"[Docker] Image: {task_metadata['image_name']}")
+                    print(f"[Docker] REPL URL: {repl_url}")
+                    
+            except Exception as e:
+                if self.config.debug:
+                    print(f"[Docker] Failed to start container: {e}")
+                    print(f"[Docker] Falling back to local REPL server")
+                # Fallback to local REPL
+                use_docker = False
+                docker_session = None
+                repl_client = REPLClient(server_url=self.config.repl.server_url)
+        else:
+            # Create a NEW REPLClient instance for this task to ensure session isolation
+            # This is critical for parallel execution - each task needs its own session
+            repl_client = REPLClient(server_url=self.config.repl.server_url)
         
         # For OOLONG/long-context: don't pass context to session (too large)
         # Instead we'll save it to file after session creation
@@ -349,11 +432,15 @@ class PythonformerPipeline:
             "max_tokens": self.config.sub_llm.max_tokens,
         }
         
+        # Enable bash only for SWE environment
+        enable_bash = (env_type == EnvironmentType.SWE)
+        
         # Create REPL session
         repl_client.create_session(
             context=session_context,
             max_output_chars=self.config.repl.max_output_chars,
-            sub_agent_config=sub_agent_config
+            sub_agent_config=sub_agent_config,
+            enable_bash=enable_bash,
         )
         
         try:
@@ -489,17 +576,20 @@ class PythonformerPipeline:
                     response = re.sub(r'<sub_agent[^>]*>.*?</sub_agent>', '', response, flags=re.DOTALL)
                     response = response.strip()
                 
-                # Extract Python blocks first
+                # Extract Python blocks first (for backward compatibility check)
                 python_blocks = self._extract_python_blocks(response)
+                
+                # Extract all code blocks (python and bash) in order
+                code_blocks = self._extract_code_blocks(response)
                 
                 # Check for final answer
                 final_answer = self._extract_final_answer(response)
                 
-                # Rule: Cannot give final_answer in same turn as python blocks
+                # Rule: Cannot give final_answer in same turn as code blocks
                 # (must wait for execution results)
-                if final_answer and python_blocks:
+                if final_answer and code_blocks:
                     if self.config.debug:
-                        print(f"Warning: Model gave final_answer with python blocks - executing code first")
+                        print(f"Warning: Model gave final_answer with code blocks - executing code first")
                     # Remove the final_answer from response, execute code, continue
                     response = re.sub(r'<final_answer>.*?</final_answer>', '', response, flags=re.DOTALL)
                     response = response.strip()
@@ -511,10 +601,10 @@ class PythonformerPipeline:
                         print(f"Warning: Model gave final_answer without any code execution - prompting for code")
                     # Instead of ignoring, prompt the model to write code
                     final_answer = None
-                    # If there are no python blocks either, inject a prompt to write code
-                    if not python_blocks:
+                    # If there are no code blocks either, inject a prompt to write code
+                    if not code_blocks:
                         # Add a system nudge to write code
-                        nudge_msg = "You must execute Python code before providing a final answer. Please write code in <python> tags to solve this problem step by step."
+                        nudge_msg = "You must execute code before providing a final answer. Please write code in <python> or <bash> tags to solve this problem step by step."
                         turns.append(Turn(role="tool", content=nudge_msg))
                         messages.append({"role": "user", "content": nudge_msg})
                         continue  # Skip adding the assistant response, get new one
@@ -535,7 +625,7 @@ class PythonformerPipeline:
                         num_errors=num_errors,
                     )
                 
-                if not python_blocks:
+                if not code_blocks:
                     # No code blocks and no valid final answer - model might be done or confused
                     # Check if the response contains a boxed answer without proper tags
                     boxed_in_response = self._extract_boxed_answers(response)
@@ -554,13 +644,22 @@ class PythonformerPipeline:
                         )
                     break
                 
-                for code in python_blocks:
+                # Execute all code blocks in order
+                for block_type, code in code_blocks:
                     # Pretty print code block in debug mode
                     if self.config.debug:
-                        print_subheader(f"Executing Code Block #{num_code_blocks + 1}", Colors.MAGENTA)
+                        block_label = "Python" if block_type == "python" else "Bash"
+                        print_subheader(f"Executing {block_label} Block #{num_code_blocks + 1}", Colors.MAGENTA)
                         print_code_block(code)
                     
-                    result = repl_client.execute(code)
+                    # Execute based on block type
+                    if block_type == "python":
+                        result = repl_client.execute(code)
+                    elif block_type == "bash":
+                        result = repl_client.execute_bash(code)
+                    else:
+                        continue  # Skip unknown block types
+                    
                     num_code_blocks += 1
                     
                     # Track rewards
@@ -569,7 +668,7 @@ class PythonformerPipeline:
                     if result.error:
                         num_errors += 1
                     
-                    # Pretty print REPL output in debug mode
+                    # Pretty print output in debug mode
                     if self.config.debug:
                         print_repl_output(
                             output=result.output,
@@ -577,14 +676,15 @@ class PythonformerPipeline:
                             execution_time_ms=result.execution_time_ms,
                             truncated=result.truncated
                         )
-                        # Print sub-agent calls
-                        for sub_call in result.sub_agent_calls:
-                            print_colored(f"  <sub_agent> task: {sub_call.task[:100]}...", Colors.CYAN)
-                            print_colored(f"  response: {sub_call.response}", Colors.GREEN)
-                        if result.state_formatted and result.state_formatted != "(empty state)":
+                        # Print sub-agent calls (only for python blocks)
+                        if block_type == "python" and result.sub_agent_calls:
+                            for sub_call in result.sub_agent_calls:
+                                print_colored(f"  <sub_agent> task: {sub_call.task[:100]}...", Colors.CYAN)
+                                print_colored(f"  response: {sub_call.response}", Colors.GREEN)
+                        if block_type == "python" and result.state_formatted and result.state_formatted != "(empty state)":
                             print_state(result.state_formatted)
                     
-                    # Format observation with <repl> tags
+                    # Format observation
                     obs_parts = [result.output] if result.output else []
                     if result.execution_time_ms > 100:
                         obs_parts.append(f"[Execution: {result.execution_time_ms}ms]")
@@ -597,20 +697,26 @@ class PythonformerPipeline:
                     
                     obs_content = "\n".join(obs_parts) if obs_parts else "(no output)"
                     
-                    # Build tool response with <repl> and <state> tags
-                    repl_response = f"<repl>\n{obs_content}\n</repl>"
+                    # Build tool response with appropriate tags
+                    if block_type == "bash":
+                        # Bash output uses <bash_output> tags
+                        tool_response = f"<bash_output>\n{obs_content}\n</bash_output>"
+                    else:
+                        # Python output uses <repl> and <state> tags
+                        tool_response = f"<repl>\n{obs_content}\n</repl>"
+                        
+                        # Add sub-agent responses if any
+                        if result.sub_agent_calls:
+                            for sub_call in result.sub_agent_calls:
+                                task_preview = sub_call.task[:100] + "..." if len(sub_call.task) > 100 else sub_call.task
+                                tool_response += f'\n<sub_agent task="{task_preview}">\n{sub_call.response}\n</sub_agent>'
+                        
+                        # Add state if there's meaningful state to show
+                        if result.state_formatted and result.state_formatted != "(empty state)":
+                            tool_response += f"\n<state>\n{result.state_formatted}\n</state>"
                     
-                    # Add sub-agent responses if any
-                    for sub_call in result.sub_agent_calls:
-                        task_preview = sub_call.task[:100] + "..." if len(sub_call.task) > 100 else sub_call.task
-                        repl_response += f'\n<sub_agent task="{task_preview}">\n{sub_call.response}\n</sub_agent>'
-                    
-                    # Add state if there's meaningful state to show
-                    if result.state_formatted and result.state_formatted != "(empty state)":
-                        repl_response += f"\n<state>\n{result.state_formatted}\n</state>"
-                    
-                    turns.append(Turn(role="tool", content=repl_response, code=code))
-                    messages.append({"role": "tool", "content": repl_response})
+                    turns.append(Turn(role="tool", content=tool_response, code=code))
+                    messages.append({"role": "tool", "content": tool_response})
             
             # Max turns reached - no final answer
             return TrajectoryResult(
@@ -626,6 +732,16 @@ class PythonformerPipeline:
         
         finally:
             repl_client.delete_session()
+            
+            # Cleanup Docker container if used
+            if docker_session:
+                try:
+                    docker_session.stop()
+                    if self.config.debug:
+                        print(f"[Docker] Stopped container for {task_metadata['id']}")
+                except Exception as e:
+                    if self.config.debug:
+                        print(f"[Docker] Error stopping container: {e}")
     
     # ============================================================
     # Output Formatters
@@ -808,7 +924,13 @@ class PythonformerPipeline:
         """
         Load tasks from a HuggingFace dataset using field mapping.
         
-        Uses streaming to avoid downloading large datasets.
+        For SWE tasks (environment == SWE):
+        - Always downloads full dataset (cached) for grouping by repository
+        - Groups tasks by repository for efficient Docker image management
+        - Processes repos in order until limit is reached
+        
+        For other tasks:
+        - Uses streaming to avoid downloading large datasets
         
         Args:
             dataset_name: HuggingFace dataset name
@@ -822,14 +944,68 @@ class PythonformerPipeline:
         print(f"Loading {dataset_name} (config={config}, split={split})...")
         print(f"Field mapping: {self.config.dataset.field_mapping}")
         
-        # Use streaming to avoid downloading entire dataset
-        if config:
-            ds = load_dataset(dataset_name, config, split=split, streaming=True)
+        # Check if this is a SWE task (needs grouping by repo)
+        is_swe = self.config.dataset.environment == EnvironmentType.SWE
+        filter_repos = getattr(self.config.dataset, 'filter_repos', None)
+        
+        # For SWE tasks, always download full dataset for grouping
+        # For other tasks, use streaming unless filtering
+        if is_swe or filter_repos:
+            if is_swe:
+                print(f"SWE environment detected - downloading full dataset for repo grouping...")
+            if filter_repos:
+                print(f"Repository filter: {filter_repos}")
+            
+            print(f"Downloading full dataset (cached after first download)...")
+            
+            if config:
+                ds = load_dataset(dataset_name, config, split=split)
+            else:
+                ds = load_dataset(dataset_name, split=split)
+            
+            # Apply repository filter if specified
+            if filter_repos:
+                print(f"Filtering to {len(filter_repos)} repositories...")
+                ds = ds.filter(lambda row: row.get('repo') in filter_repos)
+                print(f"After filtering: {len(ds)} tasks")
+            
+            # For SWE tasks, group by repository
+            if is_swe:
+                print("Grouping tasks by repository...")
+                from collections import defaultdict
+                
+                # Group tasks by repo
+                tasks_by_repo = defaultdict(list)
+                for row in ds:
+                    repo = row.get('repo', 'unknown')
+                    tasks_by_repo[repo].append(row)
+                
+                print(f"Found {len(tasks_by_repo)} repositories")
+                
+                # Sort repos by task count (process largest first for better progress visibility)
+                sorted_repos = sorted(tasks_by_repo.items(), key=lambda x: len(x[1]), reverse=True)
+                
+                # Flatten back to list, grouped by repo
+                grouped_rows = []
+                for repo, repo_tasks in sorted_repos:
+                    print(f"  {repo}: {len(repo_tasks)} tasks")
+                    grouped_rows.extend(repo_tasks)
+                
+                ds_iter = iter(grouped_rows)
+            else:
+                ds_iter = iter(ds)
         else:
-            ds = load_dataset(dataset_name, split=split, streaming=True)
+            # Use streaming for non-SWE tasks without filtering
+            print("Using streaming mode...")
+            if config:
+                ds = load_dataset(dataset_name, config, split=split, streaming=True)
+            else:
+                ds = load_dataset(dataset_name, split=split, streaming=True)
+            ds_iter = iter(ds)
         
         tasks = []
-        for row in ds:
+        
+        for row in ds_iter:
             if limit and len(tasks) >= limit:
                 break
                 
@@ -838,6 +1014,11 @@ class PythonformerPipeline:
             expected = self._get_field(row, "expected_answer")
             context = self._process_context(row)
             
+            # For SWE tasks, also store repo and image_name
+            if is_swe:
+                repo = row.get('repo')
+                image_name = row.get('image_name')
+            
             if not prompt:
                 continue
             
@@ -845,14 +1026,32 @@ class PythonformerPipeline:
             if not task_id:
                 task_id = f"task_{len(tasks)}"
             
-            tasks.append({
+            task_dict = {
                 "id": str(task_id),
                 "prompt": prompt,
                 "expected_answer": str(expected) if expected else None,
                 "context": context,
-            })
+            }
+            
+            # Add SWE-specific fields
+            if is_swe:
+                task_dict["repo"] = repo
+                task_dict["image_name"] = image_name
+            
+            tasks.append(task_dict)
         
         print(f"Loaded {len(tasks)} tasks")
+        
+        # Print repo distribution for SWE tasks
+        if is_swe and tasks:
+            from collections import Counter
+            repo_counts = Counter(t.get('repo') for t in tasks)
+            print(f"\nTask distribution across {len(repo_counts)} repositories:")
+            for repo, count in repo_counts.most_common(5):
+                print(f"  {repo}: {count} tasks")
+            if len(repo_counts) > 5:
+                print(f"  ... and {len(repo_counts) - 5} more repositories")
+        
         return tasks
     
     def load_math_tasks(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -938,7 +1137,7 @@ class PythonformerPipeline:
         Process a single task and generate trajectory.
         
         Args:
-            task: Task dict with id, prompt, expected_answer, context
+            task: Task dict with id, prompt, expected_answer, context, repo, image_name
             
         Returns:
             Result dict or None if failed
@@ -948,6 +1147,13 @@ class PythonformerPipeline:
         context = task.get("context")
         expected = task.get("expected_answer")
         
+        # Build task metadata for SWE tasks (includes repo and image_name)
+        task_metadata = {
+            "id": task_id,
+            "repo": task.get("repo"),
+            "image_name": task.get("image_name"),
+        }
+        
         if self.config.debug:
             print_task_start(task_id, prompt, expected)
         
@@ -955,7 +1161,8 @@ class PythonformerPipeline:
             result = await self.generate_trajectory(
                 prompt=prompt,
                 context=context,
-                env_type=self.config.dataset.environment
+                env_type=self.config.dataset.environment,
+                task_metadata=task_metadata
             )
             
             # Extract boxed answers for validation
@@ -1112,8 +1319,17 @@ class PythonformerPipeline:
         Args:
             limit: Override config limit
         """
-        # Check server health
-        if not self.repl_client.health_check():
+        # Check server health (skip for SWE tasks with Docker)
+        is_swe = self.config.dataset.environment == EnvironmentType.SWE
+        
+        if is_swe:
+            print("\nSWE environment detected:")
+            print("  - Will attempt to use Docker containers for each task")
+            print("  - Fallback to local REPL server if Docker unavailable")
+            print("  - Start Docker Desktop if you want to use actual repositories")
+            print()
+        
+        if not is_swe and not self.repl_client.health_check():
             print("ERROR: REPL server not available!")
             print(f"Start it with: python -m datagenie.pythonformer.server --port 5003")
             return

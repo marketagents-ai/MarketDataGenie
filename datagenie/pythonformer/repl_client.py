@@ -82,6 +82,7 @@ class REPLClient:
         packages: Optional[List[str]] = None,
         max_output_chars: int = 8192,
         max_iterations: int = 30,
+        enable_bash: bool = False,
         sub_agent_config: Optional[Dict[str, Any]] = None,
         reward_config: Optional[Dict[str, float]] = None,
     ) -> str:
@@ -93,6 +94,7 @@ class REPLClient:
             packages: Python packages to pre-import
             max_output_chars: Max output truncation limit
             max_iterations: Max iterations before episode ends
+            enable_bash: Enable bash command execution (default: False)
             sub_agent_config: Config for sub-agent calls (model, client, temperature, max_tokens)
             reward_config: RL reward configuration (on_success, on_iteration, on_error, on_failure)
             
@@ -102,6 +104,7 @@ class REPLClient:
         payload = {
             "max_output_chars": max_output_chars,
             "max_iterations": max_iterations,
+            "enable_bash": enable_bash,
         }
         if context:
             payload["context"] = context
@@ -173,6 +176,43 @@ class REPLClient:
             iteration=data.get("iteration", 0),
             reward=data.get("reward", 0.0),
             episode_state=data.get("episode_state", {}),
+        )
+    
+    def execute_bash(self, code: str, timeout: Optional[int] = None, session_id: Optional[str] = None) -> ExecutionResult:
+        """
+        Execute bash commands in a session.
+        
+        Args:
+            code: Bash commands to execute
+            timeout: Optional timeout in seconds
+            session_id: Session ID (uses current session if not provided)
+            
+        Returns:
+            ExecutionResult with output, errors
+        """
+        sid = session_id or self.session_id
+        if not sid:
+            raise ValueError("No session ID. Call create_session() first.")
+        
+        payload = {"code": code}
+        if timeout is not None:
+            payload["timeout"] = timeout
+        
+        resp = requests.post(
+            f"{self.server_url}/session/{sid}/execute_bash",
+            json=payload,
+            timeout=max(timeout or 120, 120)
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        return ExecutionResult(
+            success=data.get("success", False),
+            output=data.get("output", ""),
+            error=data.get("error"),
+            truncated=data.get("truncated", False),
+            execution_time_ms=data.get("execution_time_ms", 0),
+            files_created=data.get("files_created", []),
         )
     
     def get_state(self, session_id: Optional[str] = None) -> Dict[str, Any]:

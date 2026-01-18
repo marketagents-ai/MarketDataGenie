@@ -1,0 +1,74 @@
+# SWE-Agent Configuration for Pythonformer
+# Software Engineering tasks: bug fixing and feature implementation
+
+# Main LLM (orchestrator)
+main_model: "Hermes-4-405B"
+main_client: "litellm"
+main_temperature: 0.7
+main_max_tokens: 8192
+
+# Sub-LLM (for sub_agent calls)
+sub_model: "Hermes-4-70B"
+sub_client: "litellm"
+sub_temperature: 0.3
+sub_max_tokens: 2048
+
+# REPL settings
+repl:
+  server_url: "http://localhost:5003"
+  max_output_chars: 16384  # Larger for test outputs
+  max_output_lines: 1000
+  timeout_seconds: 180  # Longer for test execution
+  max_turns: 30  # More turns for complex debugging
+  enable_filesystem: true
+
+# Dataset settings
+dataset:
+  environment: "swe"
+  
+  # SWE-smith-py dataset from HuggingFace
+  dataset_name: "SWE-bench/SWE-smith-py"
+  dataset_split: "train"
+  
+  # Optional: Filter to specific repositories (for testing)
+  # Uncomment and add repos to filter, or leave empty/null for all repos
+  filter_repos:
+    - "swesmith/pytest-dev__iniconfig.16793ead"  # 63 tasks - SMALLEST repo
+  
+  # TESTING: Set to true to skip Docker and use local REPL (no /testbed)
+  skip_docker: false  # Docker enabled - will pull image on first run
+  
+  # Other options:
+  # filter_repos:
+  #   - "swesmith/pytest-dev__iniconfig.16793ead"      # 63 tasks - SMALLEST
+  #   - "swesmith/pydantic__pydantic.acb0f10f"         # 676 tasks
+  #   - "swesmith/pandas-dev__pandas.95280573"         # 2,354 tasks
+  #   - "swesmith/sqlfluff__sqlfluff.50a1c4b6"         # 1,293 tasks
+  
+  # Field mapping for SWE-smith dataset
+  field_mapping:
+    id: "instance_id"
+    prompt: "problem_statement"
+    expected_answer: "patch"
+    # Additional SWE-specific fields:
+    # - repo: repository name (e.g., "conan-io/conan")
+    # - image_name: docker image (e.g., "swebench/swesmithpy_conan-io__conan")
+    # - FAIL_TO_PASS: list of tests that should pass after fix
+    # - PASS_TO_PASS: list of tests that should remain passing
+  
+  # Output settings
+  output_dir: "outputs/pythonformer_swe"
+  output_sharegpt: true
+  mask_observations: false
+  batch_size: 2  # Lower for SWE (more complex tasks)
+  limit: null  # Process all tasks (or set a number for testing)
+  
+  # Tips in system prompt
+  include_tips: true
+
+# Reward settings
+enable_rewards: true
+reward_function: "simple"  # Can be changed to "test_based" once implemented
+
+# Debug mode
+debug: false
