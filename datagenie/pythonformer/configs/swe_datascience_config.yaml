@@ -1,0 +1,87 @@
+# SWE-Agent Configuration for Data Science Repositories
+# Focuses on pandas, dask, SQL tools, ML utilities, etc.
+
+# Main LLM (orchestrator)
+main_model: "Hermes-4-405B"
+main_client: "litellm"
+main_temperature: 0.7
+main_max_tokens: 8192
+
+# Sub-LLM (for sub_agent calls)
+sub_model: "Hermes-4-70B"
+sub_client: "litellm"
+sub_temperature: 0.3
+sub_max_tokens: 2048
+
+# REPL settings
+repl:
+  server_url: "http://localhost:5003"
+  max_output_chars: 16384
+  max_output_lines: 1000
+  timeout_seconds: 180
+  max_turns: 30
+  enable_filesystem: true
+
+# Dataset settings
+dataset:
+  environment: "swe"
+  
+  # SWE-smith-py dataset from HuggingFace
+  dataset_name: "SWE-bench/SWE-smith-py"
+  dataset_split: "train"
+  
+  # Filter to only data science repos
+  filter_repos:
+    - "swesmith/pandas-dev__pandas.95280573"
+    - "swesmith/pydata__patsy.a5d16484"
+    - "swesmith/dask__dask.5f61e423"
+    - "swesmith/modin-project__modin.8c7799fd"
+    - "swesmith/HIPS__autograd.ac044f0d"
+    - "swesmith/Project-MONAI__MONAI.a09c1f08"
+    - "swesmith/sunpy__sunpy.f8edfd5c"
+    - "swesmith/pydicom__pydicom.7d361b3d"
+    - "swesmith/sqlfluff__sqlfluff.50a1c4b6"
+    - "swesmith/tobymao__sqlglot.036601ba"
+    - "swesmith/kayak__pypika.1c9646f0"
+    - "swesmith/andialbrecht__sqlparse.e57923b3"
+    - "swesmith/iterative__dvc.1d6ea681"
+    - "swesmith/facebookresearch__hydra.0f03eb60"
+    - "swesmith/facebookresearch__fvcore.a491d5b9"
+    - "swesmith/stanfordnlp__dspy.651a4c71"
+    - "swesmith/stanfordnlp__string2string.c4a72f59"
+    - "swesmith/pudo__dataset.5c2dc8d3"
+    - "swesmith/burnash__gspread.a8be3b96"
+    - "swesmith/amueller__word_cloud.ec24191c"
+    - "swesmith/weaveworks__grafanalib.5c3b17ed"
+    - "swesmith/cloudpipe__cloudpickle.6220b0ce"
+    - "swesmith/pyutils__line_profiler.a646bf0f"
+    - "swesmith/cool-RR__PySnooper.57472b46"
+  
+  # Field mapping for SWE-smith dataset
+  field_mapping:
+    id: "instance_id"
+    prompt: "problem_statement"
+    expected_answer: "patch"
+  
+  # Output settings
+  output_dir: "outputs/pythonformer_swe_datascience"
+  output_sharegpt: true
+  mask_observations: false
+  batch_size: 2
+  limit: null  # Process all tasks in filtered repos
+  
+  # Tips in system prompt
+  include_tips: true
+
+# Docker settings for optimized batching
+docker:
+  cleanup_images: true      # Remove images after each batch
+  parallel_tasks: 1         # Sequential processing
+  prepull_batch: false      # Pull on-demand (images are large)
+
+# Reward settings
+enable_rewards: true
+reward_function: "simple"
+
+# Debug mode
+debug: false

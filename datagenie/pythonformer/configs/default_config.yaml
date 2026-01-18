@@ -1,0 +1,45 @@
+# Pythonformer Default Configuration
+
+# Main model settings
+main_model: "Hermes-4-405B"
+main_client: "litellm"
+main_temperature: 0.7
+main_max_tokens: 8192
+
+# REPL sandbox settings
+repl:
+  server_url: "http://localhost:5003"
+  max_output_chars: 8192
+  max_output_lines: 500
+  timeout_seconds: 120
+  max_turns: 20
+
+# Sub-LLM settings
+sub_llm:
+  model: "Hermes-4-70B"
+  client: "litellm"
+  max_parallel: 8
+  timeout_seconds: 60
+  max_tokens: 4096
+  temperature: 0.7
+
+# Dataset generation settings
+dataset:
+  environment: "math-python"
+  dataset_name: "nvidia/Nemotron-Math-v2"
+  dataset_config: null
+  dataset_split: "medium"
+  field_mapping:
+    id: "uuid"
+    prompt: "problem"
+    expected_answer: "expected_answer"
+    context: null
+  context_processor: null
+  batch_size: 4
+  limit: 100
+  include_tips: true
+  output_dir: "outputs/pythonformer"
+  output_sharegpt: true
+  mask_observations: false
+
+debug: false

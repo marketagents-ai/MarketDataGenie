@@ -28,6 +28,18 @@ A web-based SQL dashboard specifically designed for visualizing and exploring Po
 - JSON content searching
 - Real-time search with debouncing
 
+### Specialized LLM Features
+- **XML Tag Highlighting**: Visual distinction for special tags (`<python>`, `<repl>`, `<think>`, `<final_answer>`).
+- **Smart Modal Views**:
+  - **Conversational View**: Bubble chat interface with role-based styling (User, Assistant, Tool).
+  - **JSON View**: Syntax-highlighted JSON with support for nested XML tag highlighting.
+  - **Text View**: Raw text fall-back.
+- **Robust Data Handling**: Correctly escapes HTML content to preserve custom XML tags in all views.
+- **UI Refinements**: 
+  - UUID truncation for cleaner tables.
+  - Zebra striping for readability.
+  - Inline row expansion.
+
 ### Database Integration
 - PostgreSQL integration with JSON/JSONB support
 - Dynamic table and column detection

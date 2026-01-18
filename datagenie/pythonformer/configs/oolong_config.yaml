@@ -1,0 +1,44 @@
+# Pythonformer Config for OOLONG Long-Context Tasks
+# D&D transcript analysis - counting, aggregation, reasoning over long documents
+
+# LLM settings
+main_model: "Hermes-4-405B"
+main_client: "litellm"
+main_temperature: 0.7
+main_max_tokens: 4096
+
+# Sub-LLM for llm_query() calls (recursive queries over chunks)
+sub_model: "Hermes-4-70B"
+sub_client: "litellm"
+sub_temperature: 0.3
+sub_max_tokens: 2048
+
+# REPL settings
+repl:
+  server_url: "http://localhost:5003"
+  max_output_chars: 8192
+  max_turns: 10  # More turns for long-context exploration
+  timeout_seconds: 180
+
+# Dataset settings
+dataset:
+  environment: "oolong"
+  dataset_name: "oolongbench/oolong-real"
+  dataset_config: "dnd"
+  dataset_split: "validation"
+  field_mapping:
+    id: "id"
+    prompt: "question"
+    expected_answer: "answer"
+    context: "context_window_text"
+  context_processor: "oolong"  # Special handling for oolong context
+  output_dir: "outputs/pythonformer_oolong"
+  output_sharegpt: true
+  mask_observations: false
+  batch_size: 4  # Lower batch size for long-context tasks
+  limit: null
+  enable_rewards: false  # Toggle: set to true to enable reward computation
+  reward_function: "simple"  # Options: "simple", "efficiency", "normalized"
+
+# Debug settings
+debug: false
