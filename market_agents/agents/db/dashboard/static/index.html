@@ -1,17 +1,475 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <title>MarketAgents SQL Dashboard</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.1/plotly.min.js"></script>
     <link rel="stylesheet" href="/static/styles.css">
+    <style>
+        .collapsed-view {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 13px;
+            color: #495057;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 100%;
+        }
+
+        .collapsed-view:hover {
+            background: #e2e6ea;
+            border-color: #dee2e6;
+        }
+
+        .collapsed-icon {
+            color: #6c757d;
+            font-size: 16px;
+        }
+
+        .message-count {
+            background: #e9ecef;
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: bold;
+            color: #495057;
+        }
+
+        .conversation-container {
+            background: #fff;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 16px;
+            max-height: 600px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            margin-top: 8px;
+        }
+
+        .bubble {
+            padding: 12px 16px;
+            border-radius: 12px;
+            max-width: 90%;
+            line-height: 1.6;
+            font-size: 14px;
+            position: relative;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+
+        .role-label {
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            display: block;
+        }
+
+        .role-system {
+            align-self: center;
+            background: #f8f9fa;
+            color: #666;
+            text-align: center;
+            max-width: 100%;
+            border: 1px dashed #dee2e6;
+        }
+
+        .role-user,
+        .role-human {
+            align-self: flex-end;
+            background: #e3f2fd;
+            color: #0d47a1;
+            border-bottom-right-radius: 2px;
+            border: 1px solid #bbdefb;
+        }
+
+        .role-assistant,
+        .role-gpt,
+        .role-model {
+            align-self: flex-start;
+            background: #f3e5f5;
+            color: #4a148c;
+            border-bottom-left-radius: 2px;
+            border: 1px solid #e1bee7;
+        }
+
+        .role-tool,
+        .role-environment {
+            align-self: flex-start;
+            background: #fff3e0;
+            color: #e65100;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 12px;
+            border: 1px solid #ffe0b2;
+            width: 100%;
+        }
+
+        .view-toggle {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 4px;
+        }
+
+        .toggle-btn {
+            font-size: 12px;
+            color: #564caf;
+            cursor: pointer;
+            background: none;
+            border: none;
+            padding: 4px 8px;
+        }
+
+        .toggle-btn:hover {
+            text-decoration: underline;
+        }
+
+        /* Table Container for Sticky Header */
+        .table-container {
+            max-height: 80vh;
+            /* Adjust based on your header/controls height */
+            overflow: auto;
+            /* Handles both X and Y scroll */
+            position: relative;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+        }
+
+        /* Modal Styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-content {
+            background: white;
+            width: 80%;
+            max-width: 900px;
+            max-height: 85vh;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            font-family: 'Roboto', sans-serif;
+        }
+
+        .modal-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid #dee2e6;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #f8f9fa;
+        }
+
+        .modal-title {
+            font-weight: bold;
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #666;
+        }
+
+        .modal-body {
+            padding: 20px;
+            overflow-y: auto;
+            flex: 1;
+            background: #fff;
+        }
+
+        .cell-actions {
+            display: flex;
+            gap: 4px;
+            margin-left: 8px;
+            opacity: 0.6;
+            transition: opacity 0.2s;
+        }
+
+        .cell-wrapper:hover .cell-actions {
+            opacity: 1;
+        }
+
+        .action-btn {
+            background: #e9ecef;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            padding: 2px 6px;
+            cursor: pointer;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #495057;
+        }
+
+        .action-btn:hover {
+            background: #dee2e6;
+            color: #212529;
+        }
+
+        .cell-wrapper {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+        }
+
+        /* Truncate ID columns */
+        .cell-id .cell-raw {
+            max-width: 120px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* Updated CSS for Cell Content */
+        .cell-content,
+        .cell-raw,
+        .cell-pretty {
+            font-family: 'Roboto Mono', monospace;
+            font-size: 13px;
+            line-height: 1.4;
+            color: #333;
+            max-width: 100%;
+            word-break: break-word;
+        }
+
+        .cell-raw {
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            white-space: pre-wrap;
+        }
+
+        .cell-pretty {
+            display: none;
+            white-space: pre-wrap;
+            /* formatted json */
+        }
+
+        /* When row is expanded, swap raw and pretty */
+        tr.expanded .cell-raw {
+            display: none;
+        }
+
+        tr.expanded .cell-pretty {
+            display: block;
+            -webkit-line-clamp: unset;
+            line-clamp: unset;
+            max-height: none;
+            overflow: visible;
+        }
+
+        tr {
+            cursor: pointer;
+            /* Indicate row is clickable */
+            transition: background-color 0.2s ease;
+        }
+
+        tr:hover {
+            background-color: #e2e6ea !important;
+            /* Slightly darker on hover */
+        }
+
+        /* Zebra Striping */
+        tbody tr:nth-child(odd) {
+            background-color: #ffffff;
+        }
+
+        tbody tr:nth-child(even) {
+            background-color: #f8f9fa;
+            /* Light grey for even rows */
+        }
+
+        /* Updated CSS for Multi-line Clamping and Expansion */
+
+
+        /* Conversation & Modal Styles */
+        .json-pre-modal {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 13px;
+            overflow-x: auto;
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .conversation-container {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .bubble {
+            padding: 10px 14px;
+            border-radius: 12px;
+            max-width: 80%;
+            line-height: 1.5;
+            font-size: 14px;
+            position: relative;
+        }
+
+        .role-user {
+            align-self: flex-end;
+            background-color: #007bff;
+            color: #fff;
+            border-bottom-right-radius: 2px;
+        }
+
+        .role-model,
+        .role-assistant {
+            align-self: flex-start;
+            background-color: #e9ecef;
+            color: #333;
+            border-bottom-left-radius: 2px;
+        }
+
+        .role-system {
+            align-self: center;
+            background-color: #fff3cd;
+            color: #856404;
+            max-width: 90%;
+            font-size: 12px;
+            border: 1px solid #ffeeba;
+        }
+
+        .role-label {
+            font-size: 10px;
+            font-weight: bold;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+            display: block;
+            opacity: 0.8;
+        }
+
+        /* XML/Tag Highlighting */
+        .xml-tag {
+            color: #0000ff;
+            font-weight: bold;
+        }
+
+        .python-tag {
+            color: #800080;
+            font-weight: bold;
+        }
+
+        .repl-tag {
+            color: #d63384;
+            font-weight: bold;
+        }
+
+        .think-tag {
+            color: #0ddd22;
+            font-style: italic;
+        }
+
+        /* JSON Syntax Highlighting */
+        .string {
+            color: #028a0f;
+        }
+
+        /* Green for strings */
+        .number {
+            color: #d71414;
+        }
+
+        /* Red for numbers */
+        .boolean {
+            color: #0000ff;
+        }
+
+        /* Blue for booleans */
+        .null {
+            color: #888;
+        }
+
+        /* Grey for null */
+        .key {
+            color: #a52a2a;
+        }
+
+        /* Brown for keys */
+        .json-key {
+            color: #a52a2a;
+            font-weight: bold;
+        }
+
+        /* Contracted columns (ID, Date, Metadata keys) */
+        .cell-contract {
+            width: 120px;
+            max-width: 120px;
+            min-width: 120px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* Conversation Columns - Largest */
+        .cell-conversation {
+            min-width: 400px;
+            width: 40%;
+        }
+
+        /* JSON/Text Columns - Medium */
+        .cell-medium {
+            min-width: 250px;
+            width: 20%;
+        }
+
+        /* Reduced Columns - Smaller than Medium but not Contracted */
+        .cell-reduced {
+            min-width: 150px;
+        }
+
+        /* Allow these to shrink if needed, but they are small by default */
+        th.cell-contract {
+            width: 120px;
+            max-width: 120px;
+        }
+    </style>
 </head>
+
 <body>
+    <!-- (Header and Controls remain the same, simplified in replacement) -->
     <header class="dashboard-header">
         <h1>MarketAgents LLM Dashboard</h1>
         <img src="static/marketagents_logo.png" alt="MarketAgents Logo" class="logo">
     </header>
     <div class="dashboard">
+        <!-- Controls... -->
         <div class="controls-container">
             <button id="refreshButton" class="refresh-button"> ↺ </button>
             <button id="exportMarkdownButton">Export Markdown</button>
@@ -36,11 +494,25 @@
             <div id="dataChart"></div>
             <pre id="markdownOutput" class="markdown-output"></pre>
         </div>
-        <div style="overflow-x: auto;">
+        <div class="table-container">
             <table id="dataTable">
                 <thead id="tableHead"></thead>
                 <tbody id="tableBody"></tbody>
             </table>
+        </div>
+    </div>
+    </div>
+
+    <!-- Modal Container (Same as before) -->
+    <div id="detailModal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title" id="modalTitle">Details</div>
+                <button class="modal-close" onclick="closeModal()">×</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <!-- Content goes here -->
+            </div>
         </div>
     </div>
 
@@ -48,6 +520,232 @@
         let currentPage = 1;
         let totalPages = 1;
         let pageSize = 100;
+
+        // ... (fetch functions same as before) ...
+
+        // Helper to escape HTML to prevent browser from parsing custom tags as elements
+        function escapeHtml(unsafe) {
+            if (!unsafe) return "";
+            return String(unsafe)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // Helper to highlight specific XML-like tags after escaping
+        function highlightXmlTags(escapedText) {
+            // Replaces escaped tags like &lt;python&gt; with <span class="python-tag">&lt;python&gt;</span>
+            // We use a regex that matches the escaped versions
+
+            // Map of tagname -> css class
+            const tagMap = {
+                'python': 'python-tag',
+                'repl': 'repl-tag',
+                'think': 'think-tag',
+                'final_answer': 'xml-tag'
+            };
+
+            let text = escapedText;
+
+            // Generic XML tag highlighter for known tags
+            for (const [tag, className] of Object.entries(tagMap)) {
+                // Open tag: &lt;tag&gt;
+                const openRegex = new RegExp(`&lt;${tag}&gt;`, 'g');
+                text = text.replace(openRegex, `<span class="${className}">&lt;${tag}&gt;</span>`);
+
+                // Close tag: &lt;/tag&gt;
+                const closeRegex = new RegExp(`&lt;/${tag}&gt;`, 'g');
+                text = text.replace(closeRegex, `<span class="${className}">&lt;/${tag}&gt;</span>`);
+            }
+
+            // Optional: generic highlighter for other tags if needed, but risky if huge text
+            // text = text.replace(/&lt;(\/?[a-zA-Z0-9_]+)&gt;/g, '<span class="xml-tag">&lt;$1&gt;</span>');
+
+            return text;
+        }
+
+        // REPLACEMENT START: populateTable and renderCellWithActions
+
+        function renderCellWithActions(data, fullJson, type) {
+            // type: 'conversation', 'json', 'text'
+
+            // 1. Raw Data (Squashed) for Collapsed View
+            const rawData = (typeof data === 'string') ? data : JSON.stringify(data);
+
+            // 2. Pretty Data (Indented) for Expanded View
+            const prettyData = (typeof data === 'string') ? data : JSON.stringify(data, null, 2);
+
+            let buttons = '';
+            // Buttons just open Modals
+            if (type === 'conversation') {
+                buttons = `
+                    <button class="action-btn" title="Conversational View" onclick="event.stopPropagation(); openConversationModal(this)">
+                        <span>💬</span>
+                    </button>
+                    <button class="action-btn" title="Raw JSON" onclick="event.stopPropagation(); openJsonModal(this)">
+                        <span>{}</span>
+                    </button>
+                `;
+            } else if (type === 'json') {
+                buttons = `
+                    <button class="action-btn" title="JSON View" onclick="event.stopPropagation(); openJsonModal(this)">
+                        <span>{}</span>
+                    </button>
+                `;
+            } else {
+                // Text
+                buttons = '';
+            }
+
+            // We must FULLY escape the JSON before putting it in the DOM, otherwise <tags> get parsed as HTML and stripped.
+            const safeContent = escapeHtml(fullJson);
+
+            // Escape HTML for display AND apply highlighting
+            // For the table cell view, we might just want clean text unless 'expanded'
+            const displayRaw = escapeHtml(rawData);
+
+            // For indented view (pretty), allow highlighting
+            const displayPretty = highlightXmlTags(escapeHtml(prettyData));
+
+            return `
+                <div class="cell-wrapper">
+                    <!-- Dual Views managed by CSS -->
+                    <div class="cell-raw">${displayRaw}</div>
+                    <div class="cell-pretty">${displayPretty}</div>
+                    
+                    <div class="cell-actions">
+                        ${buttons}
+                    </div>
+                    <div class="full-data" style="display:none;">${safeContent}</div>
+                </div>
+            `;
+        }
+
+        // populateTable now adds row click handler
+        function populateTable(data, xColumn, yColumn) {
+            if (data.length === 0) {
+                document.getElementById('dataTable').style.display = 'none';
+                return;
+            } else {
+                document.getElementById('dataTable').style.display = 'table';
+            }
+
+            const tableHead = document.getElementById('tableHead');
+            const tableBody = document.getElementById('tableBody');
+
+            tableHead.innerHTML = '';
+            tableBody.innerHTML = '';
+
+            const keys = Object.keys(data[0]);
+            let validColumns = keys.filter(key => {
+                return data.some(row => row[key] !== null);
+            });
+
+            if (validColumns.length > 6) {
+                validColumns = validColumns.slice(0, 6);
+            }
+
+            // First, Determine Column Types based on the first non-null row for each key
+            const columnTypes = {}; // map key -> 'conversation' | 'json' | 'text' | 'contract' | 'default
+
+            validColumns.forEach(key => {
+                const lowerKey = key.toLowerCase();
+                if (lowerKey.includes('id') || lowerKey.includes('uuid') || lowerKey.includes('date') || lowerKey.includes('time') || lowerKey.includes('created') || lowerKey.includes('meta')) {
+                    columnTypes[key] = 'contract';
+                    return;
+                }
+
+                // Explicitly check for known text columns that shouldn't be squeezed
+                if (lowerKey === 'system' || lowerKey === 'model' || lowerKey === 'role') {
+                    columnTypes[key] = 'text'; // medium width
+                    return;
+                }
+
+                // Check content
+                const sampleRow = data.find(r => r[key] !== null) || {};
+                const value = sampleRow[key];
+
+                if (value && typeof value === 'string' && isJSON(value)) {
+                    const parsed = JSON.parse(value);
+                    if (isConversation(parsed)) {
+                        columnTypes[key] = 'conversation';
+                    } else {
+                        columnTypes[key] = 'json';
+                    }
+                } else if (value && typeof value === 'string' && value.length > 50) {
+                    // Long text
+                    columnTypes[key] = 'text';
+                } else {
+                    columnTypes[key] = 'default';
+                }
+            });
+
+            const headerRow = document.createElement('tr');
+            validColumns.forEach((key, index) => {
+                const th = document.createElement('th');
+                if (key === 'x_value' && xColumn) {
+                    th.textContent = xColumn;
+                } else if (key === 'y_value' && yColumn) {
+                    th.textContent = yColumn;
+                } else {
+                    th.textContent = key;
+                }
+                th.onclick = () => sortTable(index);
+
+                // Header classes
+                const type = columnTypes[key];
+                if (type === 'contract') th.classList.add('cell-contract');
+                else if (type === 'conversation') th.classList.add('cell-conversation');
+                else if (type === 'json' || type === 'text') th.classList.add('cell-medium');
+
+                headerRow.appendChild(th);
+            });
+            tableHead.appendChild(headerRow);
+
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+
+                // Add Row Click Handler
+                tr.onclick = function (e) {
+                    // Toggle expansion if click is NOT on a button (handled by stopPropagation, but good to double check)
+                    // The event.stopPropagation() on buttons should handle it, but this adds safety.
+                    if (!e.target.closest('button')) {
+                        this.classList.toggle('expanded');
+                    }
+                };
+
+                validColumns.forEach(key => {
+                    const td = document.createElement('td');
+                    const value = row[key];
+                    const type = columnTypes[key];
+
+                    // Apply layout class
+                    if (type === 'contract') td.classList.add('cell-contract');
+                    else if (type === 'conversation') td.classList.add('cell-conversation');
+                    else if (type === 'json' || type === 'text') td.classList.add('cell-medium');
+
+                    if (value === null) {
+                        td.textContent = 'NULL';
+                    } else if (typeof value === 'string' && isJSON(value)) {
+                        const parsed = JSON.parse(value);
+                        const isConv = isConversation(parsed);
+                        const renderType = isConv ? 'conversation' : 'json';
+                        td.innerHTML = renderCellWithActions(parsed, value, renderType);
+                    } else {
+                        const strVal = String(value);
+                        td.innerHTML = renderCellWithActions(strVal, strVal, 'text');
+                    }
+                    tr.appendChild(td);
+                });
+                tableBody.appendChild(tr);
+            });
+        }
+
+
+        // Connecting the two script parts
+
 
         async function fetchTables() {
             try {
@@ -102,12 +800,12 @@
             columns.forEach(column => {
                 const xOption = document.createElement('option');
                 const yOption = document.createElement('option');
-                
+
                 xOption.value = column.name;
                 yOption.value = column.name;
                 xOption.textContent = `${column.name} (${column.type})`;
                 yOption.textContent = `${column.name} (${column.type})`;
-                
+
                 xSelect.appendChild(xOption);
                 ySelect.appendChild(yOption);
             });
@@ -147,6 +845,162 @@
             }
         }
 
+
+
+        // Modal Functions
+        function openJsonModal(btn) {
+            const container = btn.closest('.cell-wrapper');
+            const dataStr = container.querySelector('.full-data').textContent;
+            try {
+                const data = JSON.parse(dataStr);
+                const formatted = JSON.stringify(data, null, 2);
+
+                document.getElementById('modalTitle').innerHTML = '<span>{}</span> JSON View';
+
+                // syntaxHighlight now returns HTML. We can't run highlightXmlTags AFTER it because highlightXmlTags expects escaped text.
+                // But syntaxHighlight escapes keys/values internally now.
+                // Wait, syntaxHighlight returns spans. highlightXmlTags also returns spans.
+                // We should run highlightXmlTags on the Safe HTML returned by syntaxHighlight? 
+                // OR we integrate logic.
+                // Let's modify syntaxHighlight to return escaped HTML with spans, and then we run highlightXmlTags on that HTML string?
+                // highlightXmlTags looks for &lt;python&gt;. 
+                // syntaxHighlight will turn "<python>" into <span class="string">"&lt;python&gt;"</span>
+                // So highlightXmlTags can run on the output of syntaxHighlight!
+
+                document.getElementById('modalBody').innerHTML = `<pre class="json-pre-modal">${highlightXmlTags(syntaxHighlight(formatted))}</pre>`;
+                document.getElementById('detailModal').style.display = 'flex';
+            } catch (e) {
+                console.error("Error opening JSON modal", e);
+                openTextModal(btn);
+            }
+        }
+
+        function openConversationModal(btn) {
+            const container = btn.closest('.cell-wrapper');
+            const dataStr = container.querySelector('.full-data').textContent;
+            try {
+                const data = JSON.parse(dataStr);
+
+                let bubbles = '';
+                data.forEach(msg => {
+                    const role = (msg.role || msg.from || 'unknown').toLowerCase();
+                    const content = msg.content || msg.value || JSON.stringify(msg);
+
+                    // 1. Ensure string
+                    let safeContent = String(content);
+
+                    // 2. Escape HTML characters (so <python> becomes &lt;python&gt;)
+                    safeContent = escapeHtml(safeContent);
+
+                    // 3. Highlight XML tags (turns &lt;python&gt; into <span...>...</span>)
+                    safeContent = highlightXmlTags(safeContent);
+
+                    // 4. Convert newlines to <br> for display
+                    safeContent = safeContent.replace(/\n/g, '<br>');
+
+                    bubbles += `
+                        <div class="bubble role-${role}">
+                            <span class="role-label">${role}</span>
+                            <div>${safeContent}</div>
+                        </div>
+                    `;
+                });
+
+                document.getElementById('modalTitle').innerHTML = '<span>💬</span> Conversational View';
+                document.getElementById('modalBody').innerHTML = `<div class="conversation-container" style="max-height: 100%; border:none; box-shadow:none;">${bubbles}</div>`;
+                document.getElementById('detailModal').style.display = 'flex';
+            } catch (e) {
+                console.error("Error opening Conversation modal", e);
+                openJsonModal(btn);
+            }
+        }
+
+        function openTextModal(btn) {
+            const container = btn.closest('.cell-wrapper');
+            const dataStr = container.querySelector('.full-data').textContent;
+
+            document.getElementById('modalTitle').innerHTML = '<span>📄</span> Text View';
+            document.getElementById('modalBody').innerHTML = `<pre class="json-pre-modal" style="white-space: pre-wrap;">${highlightXmlTags(escapeHtml(dataStr))}</pre>`;
+            document.getElementById('detailModal').style.display = 'flex';
+        }
+
+        function closeModal() {
+            document.getElementById('detailModal').style.display = 'none';
+        }
+
+        window.onclick = function (event) {
+            const modal = document.getElementById('detailModal');
+            if (event.target === modal) {
+                closeModal();
+            }
+        }
+
+        function syntaxHighlight(json) {
+            // First we need to properly escape the JSON string so XML tags inside strings are preserved
+            // The trick is: we want to keep the JSON structure parsable by the regex, but display the content escaped.
+            // But checking regex against escaped string is hard because invalid JSON chars like &quot;
+
+            // Simpler approach:
+            // 1. Replace special XML chars in the whole string first? No, because that breaks quotes.
+            // 2. Work on the original string, find tokens, and THEN escape them before wrapping in span.
+
+            return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function (match) {
+                var cls = 'number';
+
+                // If it starts with ", it's a string or key
+                if (/^"/.test(match)) {
+                    if (/:$/.test(match)) {
+                        cls = 'key';
+                        // Remove colon, escape keys just in case
+                        const key = match.substring(0, match.length - 1);
+                        return '<span class="json-key">' + escapeHtml(key) + '</span>:';
+                    } else {
+                        cls = 'string';
+                        // Matches a string value. Escape content!
+                        return '<span class="' + cls + '">' + escapeHtml(match) + '</span>';
+                    }
+                } else if (/true|false/.test(match)) {
+                    cls = 'boolean';
+                } else if (/null/.test(match)) {
+                    cls = 'null';
+                }
+                return '<span class="' + cls + '">' + match + '</span>';
+            });
+        }
+
+        function isConversation(data) {
+            if (!Array.isArray(data)) return false;
+            if (data.length === 0) return false;
+            // Check first item for common conversation keys
+            const keys = Object.keys(data[0]);
+            return keys.includes('role') || keys.includes('from');
+        }
+
+
+        window.toggleConversation = function (element) {
+            const container = element.parentNode;
+            let fullDataStr = container.querySelector('.full-data').textContent;
+            // Handle double-escaping if necessary
+            try {
+                const fullData = JSON.parse(fullDataStr);
+                container.innerHTML = renderExpandedView(fullData, fullDataStr);
+            } catch (e) {
+                console.error("Error toggling conversation view", e);
+            }
+        };
+
+        window.collapseConversation = function (btn) {
+            const topDiv = btn.parentNode.parentNode; // div wrapper
+            const container = topDiv.parentNode; // td
+            const fullDataStr = topDiv.querySelector('.full-data').textContent;
+            try {
+                const fullData = JSON.parse(fullDataStr);
+                container.innerHTML = renderCollapsedView(fullData, fullDataStr);
+            } catch (e) {
+                console.error("Error collapsing conversation view", e);
+            }
+        };
+
         function isJSON(str) {
             try {
                 const parsed = JSON.parse(str);
@@ -164,62 +1018,7 @@
                 .replace(/"(\w+)":/g, '<span class="json-key">"$1"</span>:');
         }
 
-        function populateTable(data, xColumn, yColumn) {
-            if (data.length === 0) {
-                document.getElementById('dataTable').style.display = 'none';
-                return;
-            } else {
-                document.getElementById('dataTable').style.display = 'table';
-            }
 
-            const tableHead = document.getElementById('tableHead');
-            const tableBody = document.getElementById('tableBody');
-            
-            tableHead.innerHTML = '';
-            tableBody.innerHTML = '';
-
-            // Get all keys and check which columns are all NULL
-            const keys = Object.keys(data[0]);
-            const validColumns = keys.filter(key => {
-                return data.some(row => row[key] !== null);
-            });
-
-            const headerRow = document.createElement('tr');
-            validColumns.forEach((key, index) => {
-                const th = document.createElement('th');
-                if (key === 'x_value' && xColumn) {
-                    th.textContent = xColumn;
-                } else if (key === 'y_value' && yColumn) {
-                    th.textContent = yColumn;
-                } else {
-                    th.textContent = key;
-                }
-                th.onclick = () => sortTable(index);
-                headerRow.appendChild(th);
-            });
-            tableHead.appendChild(headerRow);
-
-            data.forEach(row => {
-                const tr = document.createElement('tr');
-                validColumns.forEach(key => {
-                    const td = document.createElement('td');
-                    const value = row[key];
-                    if (value === null) {
-                        td.textContent = 'NULL';
-                    } else if (typeof value === 'string' && isJSON(value)) {
-                        const formattedJSON = formatJSON(value);
-                        const pre = document.createElement('pre');
-                        pre.className = 'json-formatted';
-                        pre.innerHTML = formattedJSON;
-                        td.appendChild(pre);
-                    } else {
-                        td.textContent = value;
-                    }
-                    tr.appendChild(td);
-                });
-                tableBody.appendChild(tr);
-            });
-        }
 
         // Replace your sortTable function with this corrected version
         function sortTable(n) {
@@ -275,21 +1074,21 @@
             if (viewSelect.value === 'chart') {
                 const tbody = table.getElementsByTagName('tbody')[0];
                 const rows = Array.from(tbody.getElementsByTagName('tr'));
-                
+
                 // Get the x and y values from the sorted table
                 const xValues = [];
                 const yValues = [];
-                
+
                 rows.forEach(row => {
                     const cells = row.getElementsByTagName('td');
                     // In chart view, we're looking for x_value and y_value columns
                     const xValueCell = cells[0]; // First column is x_value
                     const yValueCell = cells[1]; // Second column is y_value
-                    
+
                     if (xValueCell && yValueCell) {
                         const xValue = xValueCell.textContent.trim();
                         const yValue = yValueCell.textContent.trim();
-                        
+
                         xValues.push(xValue);
                         // Try to convert y to number if possible
                         yValues.push(!isNaN(parseFloat(yValue)) ? parseFloat(yValue) : yValue);
@@ -344,7 +1143,7 @@
         function analyzeDistribution(values) {
             const uniqueValues = new Set(values).size;
             const dataLength = values.length;
-            
+
             // If more than 50% of values are unique, consider it continuous
             return uniqueValues / dataLength > 0.5 ? 'continuous' : 'discrete';
         }
@@ -352,7 +1151,7 @@
         // Replace your initChart function with this smarter version
         function initChart(data, xColumn, yColumn) {
             const chartContainer = document.querySelector('.chart-container');
-            
+
             if (data.length === 0) {
                 chartContainer.style.display = 'none';
                 document.getElementById('dataChart').style.display = 'none';
@@ -512,7 +1311,7 @@
                 result.data.sort((a, b) => {
                     const aVal = a[firstKey];
                     const bVal = b[firstKey];
-                    
+
                     // Handle different data types
                     if (!isNaN(Date.parse(aVal)) && !isNaN(Date.parse(bVal))) {
                         // Date comparison
@@ -528,7 +1327,7 @@
             }
 
             populateTable(result.data, isChartView ? xColumn : null, isChartView ? yColumn : null);
-            
+
             if (isChartView && !searchTerm) {
                 initChart(result.data, xColumn, yColumn);
                 document.getElementById('markdownOutput').style.display = 'none';
@@ -690,13 +1489,13 @@
         function displayMarkdown(markdown) {
             const chartContainer = document.querySelector('.chart-container');
             const markdownOutput = document.getElementById('markdownOutput');
-            
+
             if (markdown.trim() === '') {
                 chartContainer.style.display = 'none';
                 markdownOutput.style.display = 'none';
                 return;
             }
-            
+
             chartContainer.style.display = 'block';
             markdownOutput.style.display = 'block';
             markdownOutput.textContent = markdown;
@@ -704,4 +1503,5 @@
         }
     </script>
 </body>
+
 </html>

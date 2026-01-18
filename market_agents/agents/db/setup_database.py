@@ -248,7 +248,18 @@ def create_tables(db_params):
     )
     """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS environment_states (
+        id SERIAL PRIMARY KEY,
+        environment_name TEXT NOT NULL,
+        round INTEGER NOT NULL,
+        state_data JSONB,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
     # Create indexes
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_environment_states_env_name ON environment_states(environment_name)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_requests_prompt_context_id ON requests(prompt_context_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_embeddings_embedding ON memory_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_auction_id ON trades(id)")
