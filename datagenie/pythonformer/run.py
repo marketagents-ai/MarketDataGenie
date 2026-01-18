@@ -131,8 +131,37 @@ def main():
     print(f"Output:       {config.dataset.output_dir}")
     print("=" * 60)
     
-    pipeline = PythonformerPipeline(config)
-    asyncio.run(pipeline.run(limit=config.dataset.limit))
+    # Initialize Database if configured
+    data_inserter = None
+    try:
+        import os
+        from market_agents.memory.config import AgentStorageConfig
+        from market_agents.memory.agent_storage.setup_db import AsyncDatabase
+        from datagenie.pythonformer.utils.db_utils import PythonformerDataInserter
+        
+        # Manually map env vars if they exist
+        db_args = {}
+        if os.getenv("DB_NAME"): db_args["db_name"] = os.getenv("DB_NAME")
+        if os.getenv("DB_USER"): db_args["user"] = os.getenv("DB_USER")
+        if os.getenv("DB_PASSWORD"): db_args["password"] = os.getenv("DB_PASSWORD")
+        if os.getenv("DB_HOST"): db_args["host"] = os.getenv("DB_HOST")
+        if os.getenv("DB_PORT"): db_args["port"] = os.getenv("DB_PORT")
+
+        db_config = AgentStorageConfig(**db_args)
+        db = AsyncDatabase(db_config)
+        data_inserter = PythonformerDataInserter(db)
+        print(f"Database insertion: ENABLED (User: {db_config.user}, DB: {db_config.db_name})")
+    except Exception as e:
+        print(f"Database insertion: DISABLED ({e})")
+
+    async def run_pipeline():
+        if data_inserter:
+            await data_inserter.db.initialize()
+        
+        pipeline = PythonformerPipeline(config, data_inserter=data_inserter)
+        await pipeline.run(limit=config.dataset.limit)
+    
+    asyncio.run(run_pipeline())
 
 
 if __name__ == "__main__":

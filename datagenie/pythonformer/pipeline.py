@@ -18,14 +18,16 @@ Usage:
 """
 
 import json
+import os
 import asyncio
 import time
 import random
 import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
-from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple, Union
+from datetime import datetime, timezone
+
+from datagenie.pythonformer.models import Turn, TrajectoryResult, PipelineStats
 
 from datasets import load_dataset
 from tqdm.asyncio import tqdm
@@ -45,85 +47,9 @@ from datagenie.pythonformer.utils.debug import (
     print_code_block, print_repl_output, print_state,
     print_final_answer, print_task_start, print_task_result
 )
+from datagenie.pythonformer.utils.db_utils import PythonformerDataInserter
 
 
-@dataclass
-class Turn:
-    """A single turn in the conversation."""
-    role: str  # "user", "assistant", "tool"
-    content: str
-    code: Optional[str] = None
-
-
-@dataclass
-class TrajectoryResult:
-    """Result of generating a trajectory."""
-    success: bool
-    final_answer: str
-    turns: List[Turn]
-    num_code_blocks: int = 0
-    system_prompt: str = ""  # The system prompt used for this trajectory
-    # Reward tracking for RL/filtering
-    total_reward: float = 0.0  # Cumulative reward across all steps
-    step_rewards: List[float] = field(default_factory=list)  # Per-step rewards
-    num_errors: int = 0  # Count of execution errors
-
-
-@dataclass
-class PipelineStats:
-    """Track pipeline statistics."""
-    total: int = 0
-    successful: int = 0
-    failed: int = 0
-    answers_correct: int = 0
-    answers_incorrect: int = 0
-    answers_unknown: int = 0  # No expected answer to compare
-    avg_turns: float = 0.0
-    avg_code_blocks: float = 0.0
-    total_turns: int = 0
-    total_code_blocks: int = 0
-    
-    def record(self, result: TrajectoryResult, answer_correct: Optional[bool] = None) -> None:
-        """Record a result."""
-        self.total += 1
-        if result.success:
-            self.successful += 1
-        else:
-            self.failed += 1
-        
-        # Track answer correctness
-        if answer_correct is True:
-            self.answers_correct += 1
-        elif answer_correct is False:
-            self.answers_incorrect += 1
-        else:
-            self.answers_unknown += 1
-        
-        self.total_turns += len(result.turns)
-        self.total_code_blocks += result.num_code_blocks
-        self.avg_turns = self.total_turns / self.total
-        self.avg_code_blocks = self.total_code_blocks / self.total
-    
-    def report(self) -> str:
-        """Generate statistics report."""
-        success_rate = (self.successful / self.total * 100) if self.total > 0 else 0
-        validated = self.answers_correct + self.answers_incorrect
-        accuracy = (self.answers_correct / validated * 100) if validated > 0 else 0
-        return f"""
-=== Pipeline Statistics ===
-Total processed:    {self.total:,}
-Successful:         {self.successful:,}
-Failed:             {self.failed:,}
-Success rate:       {success_rate:.1f}%
-Avg turns:          {self.avg_turns:.1f}
-Avg code blocks:    {self.avg_code_blocks:.1f}
-
-=== Answer Validation ===
-Correct:            {self.answers_correct:,}
-Incorrect:          {self.answers_incorrect:,}
-Unknown:            {self.answers_unknown:,}
-Accuracy:           {accuracy:.1f}% (of {validated} validated)
-"""
 
 
 class PythonformerPipeline:
@@ -134,9 +60,10 @@ class PythonformerPipeline:
     training data generation and inference.
     """
     
-    def __init__(self, config: PythonformerConfig):
+    def __init__(self, config: PythonformerConfig, data_inserter: Optional[PythonformerDataInserter] = None):
         self.config = config
         self.stats = PipelineStats()
+        self.data_inserter = data_inserter
         
         # REPL client
         self.repl_client = REPLClient(server_url=config.repl.server_url)
@@ -327,7 +254,17 @@ class PythonformerPipeline:
             )
             
             outputs = await self.orchestrator.run_parallel_ai_completion([thread])
-            return outputs[0].content if outputs and outputs[0] else ""
+            if outputs and outputs[0]:
+                response_content = outputs[0].content
+                if self.data_inserter:
+                    await self.data_inserter.insert_request({
+                        "model": self.config.main_model,
+                        "messages": messages,
+                        "system": system_prompt,
+                        "raw_response": outputs[0].model_dump() if hasattr(outputs[0], 'model_dump') else vars(outputs[0]),
+                    })
+                return response_content
+            return ""
         else:
             # Fallback to OpenAI directly
             from openai import OpenAI
@@ -340,7 +277,20 @@ class PythonformerPipeline:
                 temperature=self.config.main_temperature,
                 max_tokens=self.config.main_max_tokens,
             )
-            return response.choices[0].message.content
+            response_content = response.choices[0].message.content
+
+            # Log request to DB
+            if self.data_inserter:
+                asyncio.create_task(self.data_inserter.insert_request({
+                    "model": self.config.main_model,
+                    "messages": full_messages,
+                    "raw_response": response.model_dump() if hasattr(response, 'model_dump') else {},
+                    "completion_tokens": getattr(response.usage, 'completion_tokens', None),
+                    "prompt_tokens": getattr(response.usage, 'prompt_tokens', None),
+                    "total_tokens": getattr(response.usage, 'total_tokens', None)
+                }))
+
+            return response_content
     
     # ============================================================
     # Trajectory Generation
@@ -365,6 +315,8 @@ class PythonformerPipeline:
         Returns:
             TrajectoryResult with turns and final answer
         """
+        task_id = task_metadata.get('id', 'unknown') if task_metadata else 'unknown'
+        
         # For SWE tasks with Docker support, use DockerREPLSession
         # Otherwise use local REPL client
         skip_docker = getattr(self.config.dataset, 'skip_docker', False)
@@ -612,6 +564,17 @@ class PythonformerPipeline:
                 turns.append(Turn(role="assistant", content=response))
                 messages.append({"role": "assistant", "content": response})
                 
+                # Push state to database if inserter is available
+                if self.data_inserter:
+                    await self.data_inserter.insert_environment_state(
+                        environment_name=f"{self.config.dataset.environment.value}_{task_id}",
+                        round_num=len(turns),
+                        state_data={
+                            "turns": [t.model_dump() for t in turns],
+                            "metadata": task_metadata or {}
+                        }
+                    )
+                
                 # If we have a valid final answer (after code execution), return
                 if final_answer and num_code_blocks > 0:
                     return TrajectoryResult(
@@ -717,6 +680,17 @@ class PythonformerPipeline:
                     
                     turns.append(Turn(role="tool", content=tool_response, code=code))
                     messages.append({"role": "tool", "content": tool_response})
+
+                    # Push tool execution state to database
+                    # if self.data_inserter:
+                    #     await self.data_inserter.insert_environment_state(
+                    #         environment_name=f"{self.config.dataset.environment.value}_{task_id}",
+                    #         round_num=len(turns),
+                    #         state_data={
+                    #             "turns": [t.model_dump() for t in turns],
+                    #             "metadata": task_metadata or {}
+                    #         }
+                    #     )
             
             # Max turns reached - no final answer
             return TrajectoryResult(
@@ -1213,6 +1187,15 @@ class PythonformerPipeline:
             # Record stats after computing answer_correct
             self.stats.record(result, answer_correct=answer_correct)
             
+            # Push full trajectory and specialized records to DB
+            if self.data_inserter:
+                await self.data_inserter.insert_trajectory(
+                    result=result,
+                    task_id=task_id,
+                    env_name=self.config.dataset.environment.value,
+                    metadata=task_metadata
+                )
+            
             # Build output record
             record = {
                 "task_id": task_id,
@@ -1251,6 +1234,18 @@ class PythonformerPipeline:
                     mask_observations=self.config.dataset.mask_observations
                 )
                 self._append_jsonl(self.sharegpt_file, sharegpt)
+                
+                # Push ShareGPT record to DB
+                if self.data_inserter:
+                    await self.data_inserter.insert_sharegpt_dataset(
+                        task_id=task_id,
+                        conversations=sharegpt.get("conversations", []),
+                        metadata={
+                            "env": self.config.dataset.environment.value,
+                            "success": result.success,
+                            "final_answer": result.final_answer
+                        }
+                    )
             
             # Save ChatML format
             chatml = self.format_chatml(result, task_id)
